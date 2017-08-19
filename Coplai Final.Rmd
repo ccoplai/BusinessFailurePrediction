@@ -1,0 +1,2452 @@
+---
+title: "Final Project"
+author: "Cal Coplai""
+date: "8/7/2017""
+output: word_document
+---
+
+
+# BUSINESS FAILURE PREDICTION MODEL #
+
+### Cal Coplai, MSUI '17 Candidate ###
+### Northeastern University ###
+### In partnership with the City of Kalamazoo, MI ###
+
+---
+
+# DATA PREPARATION #
+
+### Datasets used ###
+  *Active and Inactive Personal Property Tax Accounts, City of Kalamazoo
+  *911 calls received, 2012-2016, City of Kalamazoo
+  *Code enforcement cases, 2012-2016, City of Kalamazoo
+  *Permits issued, 2012-2016, City of Kalamazoo
+  *Property inspections, 2012-2016, City of Kalamazoo
+  *Assessing and property data, 2012-2016, City of Kalamazoo
+
+### Notes on data preparation approach ###
+#### Load Inactive + Active "Businesses" (Personal Property Accounts)####
+
+Do we want only the actives that paid in 2014? (i.e., think about retroactively predicting, "out of all 2014 businesses, can we predict those that failed?")
+If they paid in 2014 and are still active, then we can use those.
+
+*2,644 total entities in analysis
+*2,450 total active
+*194 total inactive (+11 "final year", going inactive in 2017) = 205
+
+####Actives####
+*984 that have been around since 2014 or earlier (use these to predict 2014 failures)
+*153 additional been around since 2015 or earlier (use these + 14 to predict 2015 failures)
+*168 (1,305 total) additional been around since 2016 or earlier (use these + 14 + 15 to predict 2016 failrues)
+
+967 "Actives" but don't have any payments from 14-16, hard to know when they appeared, don't necessarily want to use to predict which went out in 14 (for example, maybe one of these entities opened in 16, can't assume it's been active the whole time...)
+
+Perhaps try model both ways, 
+  1. with all actives and a given year inactive, 
+  2. with only actives we know were there as of year X and year X inactives, see performance
+
+####Inactives####
+*194 that went "out" between 2014 - 2016
+*42 went out in 16
+*52 went out in 15
+*100 went out in 14
+*11 confirmed "final year" is 2017
+
+
+*Try the model first as using data from 13 to predict closures in 14, etc. Try model ensemble, and some different methods (e.g., one class SVM, logit, neural, novelty predict). If not ideal, try using 2 years prior, data from 12 and 13 to predict 14 closures, etc.*
+
+---
+
+
+
+# R CODE #
+
+First, we'll need to go through and load and prepare all of the distinct datasets. This requires a bit of effort to align property identifiers that may be different between datasets.
+
+### Businesses: Personal Property Tax Account List ###
+```{r}
+## Packages
+library(reshape2)
+library(stringr)
+library(stringdist)
+
+## Load Business Personal Property Tax Account List
+
+businesses <- read.csv(file = "2017-07-18 Active Inactive List USE.csv", head = T, stringsAsFactors = F)
+
+dim(businesses)
+```
+
+### Tax Delinquency Data ###
+```{r}
+## Load and Merge Tax Delinquent Data
+
+# Data on delinquency from 2012-2016
+# 1,782 cases of personal property tax delinquency from 2012-2016
+# 409 in 2012
+# 466 in 2013
+# 368 in 2014
+# 280 in 2015
+# 259 in 2016
+
+ppdelinquent <- read.csv(file = "2017-07-18 PP Delinquent 12_16 USE.csv", head = T, stringsAsFactors = F)
+
+dim(ppdelinquent)
+#names(ppdelinquent)
+# Want a column upon merge for 1/0 DelinquentPP12, DelinquentPP13, etc.
+# Lots of repeat offenders, perhaps a way to indicate Y/N repeat offender? 
+
+# Number of years delinquent
+aggbyPIN <- aggregate(YearPPDelinquent ~ PIN, data = ppdelinquent, FUN = length)
+#View(aggbyPIN)
+
+# Prop delinquent by year
+keepcols <- c(1, 19)
+ppdelinquentSub <- ppdelinquent[,keepcols]
+# 2012
+delinq12 <- subset(ppdelinquentSub, YearPPDelinquent == 2012)
+test <- merge(businesses, delinq12, by = "PIN", all.x = T)
+#names(test)
+colnames(test)[54] <- "DelinquentPP12"
+
+#2013
+delinq13 <- subset(ppdelinquentSub, YearPPDelinquent == 2013)
+test2 <- merge(test, delinq13, by = "PIN", all.x = T)
+colnames(test2)[55] <- "DelinquentPP13"
+
+#2014
+delinq14 <- subset(ppdelinquentSub, YearPPDelinquent == 2014)
+test3 <- merge(test2, delinq14, by = "PIN", all.x = T)
+colnames(test3)[56] <- "DelinquentPP14"
+
+#2015
+delinq15 <- subset(ppdelinquentSub, YearPPDelinquent == 2015)
+test4 <- merge(test3, delinq15, by = "PIN", all.x = T)
+colnames(test4)[57] <- "DelinquentPP15"
+
+#2016
+delinq16 <- subset(ppdelinquentSub, YearPPDelinquent == 2016)
+test5 <- merge(test4, delinq16, by = "PIN", all.x = T)
+colnames(test5)[58] <- "DelinquentPP16"
+
+#View(test5)
+
+# Then, merge in aggbyPIN
+
+businesses <- merge(test5, aggbyPIN, by = "PIN", all.x = T)
+
+
+```
+
+
+### Code Enforcement Cases ###
+```{r}
+## Load and Merge Code Enforcement
+
+enforcement <- read.csv(file = "EnforcementList12-16.csv", head = T)
+
+# Create separate Y, M, D fields for parsing
+opendate <- data.frame(do.call('rbind', strsplit(as.character(enforcement$Opened), '/', fixed = T)))
+
+# Rename
+names(opendate)[1] <- "openM"
+names(opendate)[2] <- "openD"
+names(opendate)[3] <- "openY"
+
+# Factor and order
+opendate$openY <- factor(opendate$openY, levels = c(2012:2016), ordered = T)
+opendate$openM <- factor(opendate$openM, levels = c(1:12), ordered = T)
+opendate$openD <- factor(opendate$openD, levels = c(1:31), ordered = T)
+
+# Join this back in
+enforcement <- cbind(enforcement, opendate)
+#View(enforcement)
+
+# We want a column to add back into main dataset for each property
+# With NumEnfCases12, 13, 14, 15, and 16 (essentially number of cases
+# that property had in a given year)
+
+# 2012, subset, aggregate by address, then merge
+enf12 <- subset(enforcement, openY == 2012) # subset
+aggbyAdd12 <- aggregate(Case.. ~ Address, data = enf12, FUN = length) # aggregate by address
+test <- merge(businesses, aggbyAdd12, by = "Address", all.x = T) # merge
+#names(test) 
+colnames(test)[60] <- "NumEnf12" #rename
+
+
+# 2013, subset, aggregate by address, then merge
+enf13 <- subset(enforcement, openY == 2013) 
+aggbyAdd13 <- aggregate(Case.. ~ Address, data = enf13, FUN = length) 
+test2 <- merge(test, aggbyAdd13, by = "Address", all.x = T) 
+#names(test2) 
+colnames(test2)[61] <- "NumEnf13" 
+
+
+# 2014, subset, aggregate by address, then merge
+enf14 <- subset(enforcement, openY == 2014) 
+aggbyAdd14 <- aggregate(Case.. ~ Address, data = enf14, FUN = length) 
+test3 <- merge(test2, aggbyAdd14, by = "Address", all.x = T) 
+#names(test3) 
+colnames(test3)[62] <- "NumEnf14" 
+
+
+# 2015, subset, aggregate by address, then merge
+enf15 <- subset(enforcement, openY == 2015) 
+aggbyAdd15 <- aggregate(Case.. ~ Address, data = enf15, FUN = length) 
+test4 <- merge(test3, aggbyAdd15, by = "Address", all.x = T) 
+#names(test4) 
+colnames(test4)[63] <- "NumEnf15" 
+
+
+# 2016, subset, aggregate by address, then merge
+enf16 <- subset(enforcement, openY == 2016) 
+aggbyAdd16 <- aggregate(Case.. ~ Address, data = enf16, FUN = length) 
+businesses <- merge(test4, aggbyAdd16, by = "Address", all.x = T) 
+#names(businesses) 
+colnames(businesses)[64] <- "NumEnf16" 
+
+
+```
+
+
+### Permits Issued ###
+```{r}
+
+## Load and Merge Permits
+
+
+permits <- read.csv(file = "PermitList12-16.csv", head = T)
+#dim(permits)
+
+# numeric version of amount.billed variable
+permits$Amount.Billed <- sub(',', '', permits$Amount.Billed)
+permits$BilledNum <- sub('.', '', permits$Amount.Billed)
+permits$BilledNum <- as.numeric(permits$BilledNum)
+
+# Create separate Y, M, D fields for parsing
+dateissued <- data.frame(do.call('rbind', strsplit(as.character(permits$Date.Issued), '/', fixed = T)))
+#dim(dateissued)
+# Rename
+names(dateissued)[1] <- "issuedM"
+names(dateissued)[2] <- "issuedD"
+names(dateissued)[3] <- "issuedY"
+
+# Factor and order
+dateissued$issuedY <- factor(dateissued$issuedY, levels = c(2012:2016), ordered = T)
+dateissued$issuedM <- factor(dateissued$issuedM, levels = c(1:12), ordered = T)
+dateissued$issuedD <- factor(dateissued$issuedD, levels = c(1:31), ordered = T)
+
+# Join this back in
+permits <- cbind(permits, dateissued)
+#View(permits)
+
+
+# We want a column to add back into main dataset for each property
+# With NumPermits12, 13, 14, 15, and 16 (essentially number of permits in a given yr)
+# Let's also create a column for each yr with total $ of permits (this gives us a sense
+# of the scale of work completed)
+
+
+# 2012, subset, aggregate by address, then merge
+perm12 <- subset(permits, issuedY == 2012) # subset
+aggbyAdd12 <- aggregate(Permit ~ Address, data = perm12, FUN = length) # aggregate by address
+aggbyAdd12_2 <- aggregate(BilledNum ~ Address, data = perm12, FUN = sum)
+test <- merge(businesses, aggbyAdd12, by = "Address", all.x = T) # merge
+#names(test) 
+colnames(test)[65] <- "NumPerm12" #rename
+test <- merge(test, aggbyAdd12_2, by = "Address", all.x = T)
+#names(test)
+colnames(test)[66] <- "BilledSumPerm12"
+# Change number above in [] to fit new names
+
+# 2013, subset, aggregate by address, then merge
+perm13 <- subset(permits, issuedY == 2013) 
+aggbyAdd13 <- aggregate(Permit ~ Address, data = perm13, FUN = length) 
+aggbyAdd13_2 <- aggregate(BilledNum ~ Address, data = perm13, FUN = sum)
+test2 <- merge(test, aggbyAdd13, by = "Address", all.x = T) 
+#names(test2) 
+colnames(test2)[67] <- "NumPerm13" 
+test2 <- merge(test2, aggbyAdd13_2, by = "Address", all.x = T)
+#names(test2)
+colnames(test2)[68] <- "BilledSumPerm13"
+# Change number above in [] to fit new names
+
+# 2014, subset, aggregate by address, then merge
+perm14 <- subset(permits, issuedY == 2014) 
+aggbyAdd14 <- aggregate(Permit ~ Address, data = perm14, FUN = length) 
+aggbyAdd14_2 <- aggregate(BilledNum ~ Address, data = perm14, FUN = sum)
+test3 <- merge(test2, aggbyAdd14, by = "Address", all.x = T) 
+#names(test3) 
+colnames(test3)[69] <- "NumPerm14" 
+test3 <- merge(test3, aggbyAdd14_2, by = "Address", all.x = T)
+#names(test3)
+colnames(test3)[70] <- "BilledSumPerm14"
+# Change number above in [] to fit new names
+
+# 2015, subset, aggregate by address, then merge
+perm15 <- subset(permits, issuedY == 2015) 
+aggbyAdd15 <- aggregate(Permit ~ Address, data = perm15, FUN = length) 
+aggbyAdd15_2 <- aggregate(BilledNum ~ Address, data = perm15, FUN = sum)
+test4 <- merge(test3, aggbyAdd15, by = "Address", all.x = T) 
+#names(test4) 
+colnames(test4)[71] <- "NumPerm15" 
+test4 <- merge(test4, aggbyAdd15_2, by = "Address", all.x = T)
+#names(test4)
+colnames(test4)[72] <- "BilledSumPerm15"
+# Change number above in [] to fit new names
+
+# 2016, subset, aggregate by address, then merge
+perm16 <- subset(permits, issuedY == 2016) 
+aggbyAdd16 <- aggregate(Permit ~ Address, data = perm16, FUN = length) 
+aggbyAdd16_2 <- aggregate(BilledNum ~ Address, data = perm16, FUN = sum)
+test5 <- merge(test4, aggbyAdd16, by = "Address", all.x = T) 
+#names(test5) 
+colnames(test5)[73] <- "NumPerm16" 
+businesses <- merge(test5, aggbyAdd16_2, by = "Address", all.x = T)
+#names(businesses)
+colnames(businesses)[74] <- "BilledSumPerm16"
+# Change number above in [] to fit new names
+
+
+```
+
+
+
+### Inspections ###
+```{r}
+
+## Load and Merge Inpsections
+
+inspections <- read.csv(file = "InspectionList12_16.csv", head = T)
+#dim(inspections)
+
+# Need to create binary P/F for inspection Result
+aggbyresult <- aggregate(Address ~ Result, data = inspections, FUN = length)
+#aggbyresult
+
+# We'll consider Approved, Complied, No Change, and No Violation a complete P (i.e., 0) and
+# All others some form of a Fail (i.e., 1)
+inspections$Fail <- ifelse(inspections$Result == "Approved", 0, 
+                           ifelse(inspections$Result == "Complied", 0, 
+                                  ifelse(inspections$Result == "No Change", 0, 
+                                         ifelse(inspections$Result == "No Violation", 0, 1))))
+
+
+
+# Now create separate Y, M, D fields similar to other datasets
+
+dateinsp <- data.frame(do.call('rbind', strsplit(as.character(inspections$Completed), '/', fixed = T)))
+#dim(dateinsp)
+# Rename
+names(dateinsp)[1] <- "inspectionM"
+names(dateinsp)[2] <- "inspectionD"
+names(dateinsp)[3] <- "inspectionY"
+
+# Factor and order
+dateinsp$inspectionY <- factor(dateinsp$inspectionY, levels = c(2012:2016), ordered = T)
+dateinsp$inspectionM <- factor(dateinsp$inspectionM, levels = c(1:12), ordered = T)
+dateinsp$inspectionD <- factor(dateinsp$inspectionD, levels = c(1:31), ordered = T)
+
+# Join this back in
+inspections <- cbind(inspections, dateinsp)
+#View(inspections)
+
+
+# Create Field for each Y in businesses dataset for InspFailed, PercInspFailed
+# This is the total number of inspections that were failed in a given year, and the % of total 
+# Inspections at that property in that year that resulting in a "Fail"
+
+# 2012
+insp12 <- subset(inspections, inspectionY == 2012)
+NumInsp12 <- aggregate(Fail ~ Address, data = insp12, FUN = length)
+names(NumInsp12)[2] <- "TotalInsp12" 
+FailedInsp12 <- aggregate(Fail ~ Address, data = insp12, FUN = sum)
+insp12 <- cbind(NumInsp12, FailedInsp12)
+insp12$PercFailed12 <- insp12$Fail / insp12$TotalInsp12
+#names(insp12)
+keepcols <- c(2:5)
+insp12 <- insp12[,keepcols]
+names(insp12)[3] <- "InspFail12"
+test <- merge(businesses, insp12, by = "Address", all.x = T)
+
+# 2013
+insp13 <- subset(inspections, inspectionY == 2013)
+NumInsp13 <- aggregate(Fail ~ Address, data = insp13, FUN = length)
+names(NumInsp13)[2] <- "TotalInsp13" 
+FailedInsp13 <- aggregate(Fail ~ Address, data = insp13, FUN = sum)
+insp13 <- cbind(NumInsp13, FailedInsp13)
+insp13$PercFailed13 <- insp13$Fail / insp13$TotalInsp13
+#names(insp13)
+keepcols <- c(2:5)
+insp13 <- insp13[,keepcols]
+names(insp13)[3] <- "InspFail13"
+test2 <- merge(test, insp13, by = "Address", all.x = T)
+
+# 2014
+insp14 <- subset(inspections, inspectionY == 2014)
+NumInsp14 <- aggregate(Fail ~ Address, data = insp14, FUN = length)
+names(NumInsp14)[2] <- "TotalInsp14" 
+FailedInsp14 <- aggregate(Fail ~ Address, data = insp14, FUN = sum)
+insp14 <- cbind(NumInsp14, FailedInsp14)
+insp14$PercFailed14 <- insp14$Fail / insp14$TotalInsp14
+#names(insp14)
+keepcols <- c(2:5)
+insp14 <- insp14[,keepcols]
+names(insp14)[3] <- "InspFail14"
+test3 <- merge(test2, insp14, by = "Address", all.x = T)
+
+# 2015
+insp15 <- subset(inspections, inspectionY == 2015)
+NumInsp15 <- aggregate(Fail ~ Address, data = insp15, FUN = length)
+names(NumInsp15)[2] <- "TotalInsp15" 
+FailedInsp15 <- aggregate(Fail ~ Address, data = insp15, FUN = sum)
+insp15 <- cbind(NumInsp15, FailedInsp15)
+insp15$PercFailed15 <- insp15$Fail / insp15$TotalInsp15
+#names(insp15)
+keepcols <- c(2:5)
+insp15 <- insp15[,keepcols]
+names(insp15)[3] <- "InspFail15"
+test4 <- merge(test3, insp15, by = "Address", all.x = T)
+
+# 2016
+insp16 <- subset(inspections, inspectionY == 2016)
+NumInsp16 <- aggregate(Fail ~ Address, data = insp16, FUN = length)
+names(NumInsp16)[2] <- "TotalInsp16" 
+FailedInsp16 <- aggregate(Fail ~ Address, data = insp16, FUN = sum)
+insp16 <- cbind(NumInsp16, FailedInsp16)
+insp16$PercFailed16 <- insp16$Fail / insp16$TotalInsp16
+#names(insp16)
+keepcols <- c(2:5)
+insp16 <- insp16[,keepcols]
+names(insp16)[3] <- "InspFail16"
+businesses <- merge(test4, insp16, by = "Address", all.x = T)
+
+#View(businesses)
+
+```
+
+
+
+### Assessing Data ###
+```{r}
+
+## Load and Merge Assessing
+
+# Create new Address field for businesses without Line 2 (Apt #, Ste #, etc.)
+businesses$Address2 <- paste(businesses$AddressNum, businesses$AddressDir, businesses$AddressStreet,
+                             businesses$StreetType, sep=" ")
+businesses$Address2 <- gsub("  ", " ", businesses$Address2)
+#View(businesses)
+
+# NEED TO CREATE PIN PP --> PIN RP Match. PERHAPS CONNECT ADDRESS. BUT NEED ADDRESS 1:1
+# Is there a fuzzy match algorithm?
+
+
+
+# LET's MERGE ALL THE ASSESS FILES TOGETHER FIRST THEN WITH BUSINESSES
+# Remove "REAR" from address replace with ""
+
+# 2012 #### MODIFY AT CITY GET FILE
+assess12 <- read.csv(file = "2012exportUSE.csv", head = T)
+assess12$Address2 <- gsub("REAR", "", assess12$Address)
+test <- merge(businesses, assess12, by.x = "Address", by.y = "Address2", all.x = T)
+#names(test)
+# Order by PIN_RP and Remove duplicates
+test <- test[order(test$PIN_RP),]
+test <- test[!duplicated(test[,1:89]), ]
+# Subset those that didn't find a match
+test2 <- subset(test, is.na(test$PIN_RP))
+#names(test2)
+# Only keep original businesses columns
+keepcols <- c(1:89)
+test2 <- test2[,keepcols]
+# Merge by PIN to get additional matches
+test3 <- merge(test2, assess12, by.x = "PIN", by.y = "PIN_RP", all.x = T)
+#names(test3)
+keepcols <- c(1:2, 90:93, 95:97)
+test3 <- test3[,keepcols]
+test3$PIN_RP <- test3$PIN
+#names(test3)
+# reorder
+test3 <- test3[c(2,1,10,3:9)]
+names(test3)[1] <- "Address"
+
+# Create subset of test that removes test3 cases, remove unique columns, and rbind together
+test4 <- subset(test, !is.na(test$PIN_RP))
+#names(test4)
+keepcols <- c(1:2, 91:95, 97:99)
+test4 <- test4[,keepcols]
+
+test12 <- rbind(test4, test3)
+#View(test12)
+
+
+# 2013
+assess13 <- read.csv(file = "2013exportUSE.csv", head = T)
+assess13$Address2 <- gsub("REAR", "", assess13$Address)
+test <- merge(businesses, assess13, by.x = "Address", by.y = "Address2", all.x = T)
+#names(test)
+# Remove duplicates
+test <- test[order(test$PIN_RP),]
+test <- test[!duplicated(test[,1:89]), ]
+# Subset those that didn't find a match
+test2 <- subset(test, is.na(test$PIN_RP))
+#names(test2)
+dim(test2)
+# Only keep original businesses columns
+keepcols <- c(1:89)
+test2 <- test2[,keepcols]
+# Merge by PIN to get additional matches
+test3 <- merge(test2, assess13, by.x = "PIN", by.y = "PIN_RP", all.x = T)
+#names(test3)
+keepcols <- c(1:2, 90:93, 95:97)
+test3 <- test3[,keepcols]
+test3$PIN_RP <- test3$PIN
+#names(test3)
+# reorder
+test3 <- test3[c(2,1,10,3:9)]
+names(test3)[1] <- "Address"
+
+# Create subset of test that removes test3 cases, remove unique columns, and rbind together
+test4 <- subset(test, !is.na(test$PIN_RP))
+#names(test4)
+keepcols <- c(1:2, 91:95, 97:99)
+test4 <- test4[,keepcols]
+
+test13 <- rbind(test4, test3)
+#View(test13)
+
+
+# 2014
+assess14 <- read.csv(file = "2014exportUSE.csv", head = T)
+assess14$Address2 <- gsub("REAR", "", assess14$Address)
+test <- merge(businesses, assess14, by.x = "Address", by.y = "Address2", all.x = T)
+#names(test)
+# Remove duplicates
+test <- test[order(test$PIN_RP),]
+test <- test[!duplicated(test[,1:89]), ]
+# Subset those that didn't find a match
+test2 <- subset(test, is.na(test$PIN_RP))
+#names(test2)
+dim(test2)
+# Only keep original businesses columns
+keepcols <- c(1:89)
+test2 <- test2[,keepcols]
+# Merge by PIN to get additional matches
+test3 <- merge(test2, assess14, by.x = "PIN", by.y = "PIN_RP", all.x = T)
+#names(test3)
+keepcols <- c(1:2, 90:93, 95:97)
+test3 <- test3[,keepcols]
+test3$PIN_RP <- test3$PIN
+#names(test3)
+# reorder
+test3 <- test3[c(2,1,10,3:9)]
+names(test3)[1] <- "Address"
+
+# Create subset of test that removes test3 cases, remove unique columns, and rbind together
+test4 <- subset(test, !is.na(test$PIN_RP))
+#names(test4)
+keepcols <- c(1:2, 91:95, 97:99)
+test4 <- test4[,keepcols]
+
+test14 <- rbind(test4, test3)
+#View(test14)
+
+
+# 2015
+assess15 <- read.csv(file = "2015exportUSE.csv", head = T)
+assess15$Address2 <- gsub("REAR", "", assess15$Address)
+test <- merge(businesses, assess15, by.x = "Address", by.y = "Address2", all.x = T)
+#names(test)
+# Remove duplicates
+test <- test[order(test$PIN_RP),]
+test <- test[!duplicated(test[,1:89]), ]
+# Subset those that didn't find a match
+test2 <- subset(test, is.na(test$PIN_RP))
+#names(test2)
+dim(test2)
+# Only keep original businesses columns
+keepcols <- c(1:89)
+test2 <- test2[,keepcols]
+# Merge by PIN to get additional matches
+test3 <- merge(test2, assess15, by.x = "PIN", by.y = "PIN_RP", all.x = T)
+#names(test3)
+keepcols <- c(1:2, 90:93, 95:97)
+test3 <- test3[,keepcols]
+test3$PIN_RP <- test3$PIN
+names(test3)
+# reorder
+test3 <- test3[c(2,1,10,3:9)]
+names(test3)[1] <- "Address"
+
+# Create subset of test that removes test3 cases, remove unique columns, and rbind together
+test4 <- subset(test, !is.na(test$PIN_RP))
+#names(test4)
+keepcols <- c(1:2, 91:95, 97:99)
+test4 <- test4[,keepcols]
+
+test15 <- rbind(test4, test3)
+#View(test15)
+
+
+# 2016
+assess16 <- read.csv(file = "2016exportUSE.csv", head = T)
+assess16$Address2 <- gsub("REAR", "", assess16$Address)
+test <- merge(businesses, assess16, by.x = "Address", by.y = "Address2", all.x = T)
+#names(test)
+# Remove duplicates
+test <- test[order(test$PIN_RP),]
+test <- test[!duplicated(test[,1:89]), ]
+# Subset those that didn't find a match
+test2 <- subset(test, is.na(test$PIN_RP))
+#names(test2)
+dim(test2)
+# Only keep original businesses columns
+keepcols <- c(1:89)
+test2 <- test2[,keepcols]
+# Merge by PIN to get additional matches
+test3 <- merge(test2, assess16, by.x = "PIN", by.y = "PIN_RP", all.x = T)
+#names(test3)
+keepcols <- c(1:2, 90:93, 95:97)
+test3 <- test3[,keepcols]
+test3$PIN_RP <- test3$PIN
+#names(test3)
+# reorder
+test3 <- test3[c(2,1,10,3:9)]
+names(test3)[1] <- "Address"
+
+# Create subset of test that removes test3 cases, remove unique columns, and rbind together
+test4 <- subset(test, !is.na(test$PIN_RP))
+#names(test4)
+keepcols <- c(1:2, 91:95, 97:99)
+test4 <- test4[,keepcols]
+
+test16 <- rbind(test4, test3)
+#View(test16)
+
+
+# Order all by PIN then rbind together
+test12 <- test12[order(test12$PIN),]
+test13 <- test13[order(test13$PIN),]
+test14 <- test14[order(test14$PIN),]
+test15 <- test15[order(test15$PIN),]
+test16 <- test16[order(test16$PIN),]
+
+assess12_16 <- cbind(test12, test13[,4:10], test14[,4:10], test15[,4:10], test16[,4:10])
+#View(assess12_16)
+
+#names(assess12_16)
+
+# Create binary OwnerKzoo fields
+assess12_16$OwnerKzoo12 <- ifelse(assess12_16$OwnerCity12 == "KALAMAZOO", 1, 
+                                  ifelse(assess12_16$OwnerCity12 == "Kalamazoo", 1, 0))
+assess12_16$OwnerKzoo13 <- ifelse(assess12_16$OwnerCity13 == "KALAMAZOO", 1, 
+                                  ifelse(assess12_16$OwnerCity13 == "Kalamazoo", 1, 0))
+assess12_16$OwnerKzoo14 <- ifelse(assess12_16$OwnerCity14 == "KALAMAZOO", 1, 
+                                  ifelse(assess12_16$OwnerCity14 == "Kalamazoo", 1, 0))
+assess12_16$OwnerKzoo15 <- ifelse(assess12_16$OwnerCity15 == "KALAMAZOO", 1, 
+                                  ifelse(assess12_16$OwnerCity15 == "Kalamazoo", 1, 0))
+assess12_16$OwnerKzoo16 <- ifelse(assess12_16$OwnerCity16 == "KALAMAZOO", 1, 
+                                  ifelse(assess12_16$OwnerCity16 == "Kalamazoo", 1, 0))
+
+
+# Create Owner Change field based on owner address in Year X compared to address in YearX+1
+assess12_16$OwnerChange12_13 <- ifelse(as.character(assess12_16$OwnerAddress12) != as.character(assess12_16$OwnerAddress13), 1, 0)
+assess12_16$OwnerChange13_14 <- ifelse(as.character(assess12_16$OwnerAddress13) != as.character(assess12_16$OwnerAddress14), 1, 0)
+assess12_16$OwnerChange14_15 <- ifelse(as.character(assess12_16$OwnerAddress14) != as.character(assess12_16$OwnerAddress15), 1, 0)
+assess12_16$OwnerChange15_16 <- ifelse(as.character(assess12_16$OwnerAddress15) != as.character(assess12_16$OwnerAddress16), 1, 0)
+
+# Create Zoning Change field
+assess12_16$ZoningChange12_13 <- ifelse(as.character(assess12_16$Zoning12) != as.character(assess12_16$Zoning13), 1, 0)
+assess12_16$ZoningChange13_14 <- ifelse(as.character(assess12_16$Zoning13) != as.character(assess12_16$Zoning14), 1, 0)
+assess12_16$ZoningChange14_15 <- ifelse(as.character(assess12_16$Zoning14) != as.character(assess12_16$Zoning15), 1, 0)
+assess12_16$ZoningChange15_16 <- ifelse(as.character(assess12_16$Zoning15) != as.character(assess12_16$Zoning16), 1, 0)
+
+# Create SEV and TV Growth fields
+assess12_16$SEVGrowth12_13 <- ifelse(assess12_16$SEV12 < assess12_16$SEV13, 1, 0)
+assess12_16$TVGrowth12_13 <- ifelse(assess12_16$TV12 < assess12_16$TV13, 1, 0)
+assess12_16$SEVGrowth13_14 <- ifelse(assess12_16$SEV13 < assess12_16$SEV14, 1, 0)
+assess12_16$TVGrowth13_14 <- ifelse(assess12_16$TV13 < assess12_16$TV14, 1, 0)
+assess12_16$SEVGrowth14_15 <- ifelse(assess12_16$SEV14 < assess12_16$SEV15, 1, 0)
+assess12_16$TVGrowth14_15 <- ifelse(assess12_16$TV14 < assess12_16$TV15, 1, 0)
+assess12_16$SEVGrowth15_16 <- ifelse(assess12_16$SEV15 < assess12_16$SEV16, 1, 0)
+assess12_16$TVGrowth15_16 <- ifelse(assess12_16$TV15 < assess12_16$TV16, 1, 0)
+
+#View(assess12_16)
+
+# Now merge back into businesses file
+businesses <- merge(businesses, assess12_16, by = "PIN", all.x = T)
+#View(businesses)
+
+# Then merge back into businesses
+# Then take a detailed look, might need to scrap this stuff, not confident about merge
+
+
+#View(businesses)
+
+```
+
+
+
+### 911 Call data ###
+```{r}
+
+## Load and Merge 911 data
+
+# Crimes at site, violent crimes at site, prop crimes at site, same within 1/4 mile
+# Fires at site, EMS calls at site, same within 1/4 mile
+# or 1/8 mile (more proximity)
+# By year
+
+## THIS WAS ALL TO PREPARE DATA FOR ARCGIS SPATIAL JOIN, DON'T NEED TO RE-RUN CODE CHUNK
+###############################################################
+#calls12 <- read.csv("calls_for_service_2012.csv", head = T)
+#calls13 <- read.csv("calls_for_service_2013.csv", head = T)
+#calls14 <- read.csv("calls_for_service_2014.csv", head = T)
+#calls15 <- read.csv("calls_for_service_2015.csv", head = T)
+#calls16 <- read.csv("calls_for_service_2016.csv", head = T)
+#calls911 <- rbind(calls12, calls13, calls14, calls15, calls16)
+#dim(calls911)
+#View(calls911)
+# First, aggregate by type and subset out the calls we don't need
+#aggbytype <- aggregate(call_id ~ call_type, data = calls911, FUN = length)
+#View(aggbytype)
+
+# Now, assign categories (Auto, Fire, Property, Violent, and Misc/Other)
+# Look back later for super informative categories (e.g., Embezzlement might be a major key)
+
+#calls911$Category <- ifelse(calls911$call_type == "TRAFFIC STOP", "Auto",
+#                            ifelse(calls911$call_type == "HIT AND RUN ACC", "Auto",
+#                                   ifelse(calls911$call_type == "PARKING COMPLAINT", "Auto",
+#                                          ifelse(calls911$call_type == "STOLEN VEHICLE", "Auto",
+#                                                 ifelse(calls911$call_type == "ABANDONED AUTO", "Auto",
+#                                                        ifelse(calls911$call_type == "JUNK AUTO", "Auto",
+#                                                               ifelse(calls911$call_type == "FIRE ALARM", "Fire",
+#                                                                      ifelse(calls911$call_type == "FIRE DISPATCH", "Fire",
+#                                                                             ifelse(calls911$call_type == "FIRE 1 ENGINE RESPONSE", "Fire",
+#                                                                                    ifelse(calls911$call_type == "GRASS FIRE", "Fire",
+#                                                                                           ifelse(calls911$call_type == "FIREWORKS", "Fire",
+#                                                                                                  ifelse(calls911$call_type == "PROPERTY DAMAGE ACCIDENT", "Property",
+#                                                                                                         ifelse(calls911$call_type == "LARCENY", "Property",
+#                                                                                                                ifelse(calls911$call_type == "MALICIOUS DESTRUCTION OF PROPERTY", "Property",
+#                                                                                                                       ifelse(calls911$call_type == "BREAK & ENTER", "Property",
+#                                                                                                                              ifelse(calls911$call_type == "TRESPASSING", "Property",
+#                                                                                                                                     ifelse(calls911$call_type == "LARC F/VEH", "Property",
+#                                                                                                                                            ifelse(calls911$call_type == "RETAIL FRAUD/SHOPLIFTING", "Property",
+#                                                                                                                                                   ifelse(calls911$call_type == "FRAUD", "Property",
+#                                                                                                                                                          ifelse(calls911$call_type == "Gas Leak", "Property",
+#                                                                                                                                                                 ifelse(calls911$call_type == "WIRE DOWN", "Property",
+#                                                                                                                                                                        ifelse(calls911$call_type == "Carbon Monoxide", "Property",
+#                                                                                                                                                                               ifelse(calls911$call_type == "CARBON MONOXIDE", "Property",
+#                                                                                                                                                                                      ifelse(calls911$call_type == "EMBEZZLEMENT", "Property",
+#                                                                                                                                                                                             ifelse(calls911$call_type == "ILLEGAL ENTRY", "Property",
+#                                                                                                                                                                                                    ifelse(calls911$call_type == "ATTEMPT LARCENY", "Property",
+#                                                                                                                                                                                                           ifelse(calls911$call_type == "FIGHT", "Violent",
+#                                                                                                                                                                                                                  ifelse(calls911$call_type == "ASSAULT & BATTERY", "Violent",
+#                                                                                                                                                                                                                         ifelse(calls911$call_type == "FAMILY DISTURBANCE", "Violent",
+#                                                                                                                                                                                                                                ifelse(calls911$call_type == "SUICIDE", "Violent",
+#                                                                                                                                                                                                                                       ifelse(calls911$call_type == "SHOTS FIRED", "Violent",
+#                                                                                                                                                                                                                                              ifelse(calls911$call_type == "CRIMINAL SEXUAL CONDUCT", "Violent",
+#                                                                                                                                                                                                                                                     ifelse(calls911$call_type == "FELONIOUS ASSAULT", "Violent",
+#                                                                                                                                                                                                                                                            ifelse(calls911$call_type == "CHILD ABUSE", "Violent",
+#                                                                                                                                                                                                                                                                   ifelse(calls911$call_type == "STALKING", "Violent",
+#                                                                                                                                                                                                                                                                          ifelse(calls911$call_type == "DEAD BODY", "Violent",
+#                                                                                                                                                                                                                                                                                 ifelse(calls911$call_type == "KIDNAPPING", "Violent",
+#                                                                                                                                                                                                                                                                                        ifelse(calls911$call_type == "HOMICIDE", "Violent", "Misc/Other"))))))))))))))))))))))))))))))))))))))
+
+
+#View(calls911)
+
+
+# Create Y, M, D fields
+
+# First, will need to separate out date & time, split at " "
+#date911 <- data.frame(do.call('rbind', strsplit(as.character(calls911$call_received), ' ', fixed = T)))
+
+#date911 <- data.frame(do.call('rbind', strsplit(as.character(date911$X1), '/', fixed = T)))
+
+#dim(date911)
+# Rename
+#names(date911)[1] <- "call911M"
+#names(date911)[2] <- "call911D"
+#names(date911)[3] <- "call911Y"
+
+# Factor and order
+#date911$call911Y <- factor(date911$call911Y, levels = c(2012:2016), ordered = T)
+#date911$call911M <- factor(date911$call911M, levels = c(1:12), ordered = T)
+#date911$call911D <- factor(date911$call911D, levels = c(1:31), ordered = T)
+
+# Join this back in
+#calls911 <- cbind(calls911, date911)
+#View(calls911)
+
+# Create fields for each category type created previously, these will help populate aggregate
+# counts by address in ArcGIS spatial join
+
+#calls911$Auto <- ifelse(calls911$Category == "Auto", 1, 0)
+#calls911$Fire <- ifelse(calls911$Category == "Fire", 1, 0)
+#calls911$Property <- ifelse(calls911$Category == "Property", 1, 0)
+#calls911$Violent <- ifelse(calls911$Category == "Violent", 1, 0)
+#calls911$Misc <- ifelse(calls911$Category == "Misc/Other", 1, 0)
+#View(calls911)
+
+# Subset by year and export as csv
+
+#calls12 <- subset(calls911, call911Y == 2012)
+#calls13 <- subset(calls911, call911Y == 2013)
+#calls14 <- subset(calls911, call911Y == 2014)
+#calls15 <- subset(calls911, call911Y == 2015)
+#calls16 <- subset(calls911, call911Y == 2016)
+#write.csv(calls12, "calls12.csv")
+#write.csv(calls13, "calls13.csv")
+#write.csv(calls14, "calls14.csv")
+#write.csv(calls15, "calls15.csv")
+#write.csv(calls16, "calls16.csv")
+
+# Load into ArcGIS, display x,y coordinates
+# Find count of each type by parcel boundary
+# Buffer each parcel with 500 ft buffer
+# find count of each type again within buffer 
+# should result in 10 columns per year (calls12AUto, calls12Fire, calls12Prop, calls12Viol, calls12MiscOther, calls12AutoBuffer, etc.)
+#########################################################################################
+
+
+
+
+# Load back export files from ArcGIS in and merge with business file
+
+# 2012 on location 911 calls
+calls12 <- read.csv("calls12Join.csv", head = T)
+#names(calls12)
+keepcols <- c(6, 11, 20:24)
+calls12 <- calls12[,keepcols]
+#View(calls12)
+# Merge with businesses
+test <- merge(businesses, calls12, by.x = "Address2", by.y = "Address", all.x = T)
+#names(test)
+# Remove duplicates
+test <- test[order(test$PIN.x),]
+test <- test[!duplicated(test[,1:148]), ]
+#View(test[,100:ncol(test)])
+dim(test)
+#names(test)
+names(test)[150:154] <- c("Auto911_12", "Fire911_12", "Property911_12", "Violent911_12", "Misc911_12")
+# Subset out columns to merge with businesses
+test <- test[order(test$PIN.x),]
+keepcols <- c(150:154)
+test12 <- test[,keepcols]
+
+# 2012 within 500' buffer 911 calls
+calls12 <- read.csv("calls12JoinBuffer.csv", head = T)
+#names(calls12)
+keepcols <- c(6, 11, 22:26)
+calls12 <- calls12[,keepcols]
+#View(calls12)
+# Merge with businesses
+test2 <- merge(businesses, calls12, by.x = "Address2", by.y = "Address", all.x = T)
+#names(test2)
+# Remove duplicates
+test2 <- test2[order(test2$PIN.x),]
+test2 <- test2[!duplicated(test2[,1:148]), ]
+#View(test2[,100:ncol(test2)])
+dim(test2)
+#names(test2)
+names(test2)[150:154] <- c("Auto911_12Buffer", "Fire911_12Buffer", "Prop911_12Buffer", "Violent911_12Buffer", "Misc911_12Buffer")
+# Subset out columns to merge with businesses
+test2 <- test2[order(test2$PIN.x),]
+keepcols <- c(150:154)
+test12buff <- test2[,keepcols]
+
+
+
+# 2013 on location 911 calls
+calls13 <- read.csv("calls13Join.csv", head = T)
+#names(calls13)
+keepcols <- c(6, 11, 21:25)
+calls13 <- calls13[,keepcols]
+#View(calls13)
+# Merge with businesses
+test <- merge(businesses, calls13, by.x = "Address2", by.y = "Address", all.x = T)
+#names(test)
+# Remove duplicates
+test <- test[order(test$PIN.x),]
+test <- test[!duplicated(test[,1:148]), ]
+#View(test[,100:ncol(test)])
+dim(test)
+#names(test)
+names(test)[150:154] <- c("Auto911_13", "Fire911_13", "Property911_13", "Violent911_13", "Misc911_13")
+# Subset out columns to merge with businesses
+test <- test[order(test$PIN.x),]
+keepcols <- c(150:154)
+test13 <- test[,keepcols]
+
+# 2013 within 500' buffer 911 calls
+calls13 <- read.csv("calls13JoinBuffer.csv", head = T)
+#names(calls13)
+keepcols <- c(6, 11, 23:27)
+calls13 <- calls13[,keepcols]
+#View(calls13)
+# Merge with businesses
+test2 <- merge(businesses, calls13, by.x = "Address2", by.y = "Address", all.x = T)
+#names(test2)
+# Remove duplicates
+test2 <- test2[order(test2$PIN.x),]
+test2 <- test2[!duplicated(test2[,1:148]), ]
+#View(test2[,100:ncol(test2)])
+dim(test2)
+#names(test2)
+names(test2)[150:154] <- c("Auto911_13Buffer", "Fire911_13Buffer", "Prop911_13Buffer", "Violent911_13Buffer", "Misc911_13Buffer")
+# Subset out columns to merge with businesses
+test2 <- test2[order(test2$PIN.x),]
+keepcols <- c(150:154)
+test13buff <- test2[,keepcols]
+
+
+# 2014 on location 911 calls
+calls14 <- read.csv("calls14Join.csv", head = T)
+#names(calls14)
+keepcols <- c(6, 11, 21:25)
+calls14 <- calls14[,keepcols]
+#View(calls14)
+# Merge with businesses
+test <- merge(businesses, calls14, by.x = "Address2", by.y = "Address", all.x = T)
+#names(test)
+# Remove duplicates
+test <- test[order(test$PIN.x),]
+test <- test[!duplicated(test[,1:148]), ]
+#View(test[,100:ncol(test)])
+dim(test)
+#names(test)
+names(test)[150:154] <- c("Auto911_14", "Fire911_14", "Property911_14", "Violent911_14", "Misc911_14")
+# Subset out columns to merge with businesses
+test <- test[order(test$PIN.x),]
+keepcols <- c(150:154)
+test14 <- test[,keepcols]
+
+# 2014 within 500' buffer 911 calls
+calls14 <- read.csv("calls14JoinBuffer.csv", head = T)
+#names(calls14)
+keepcols <- c(6, 11, 23:27)
+calls14 <- calls14[,keepcols]
+#View(calls14)
+# Merge with businesses
+test2 <- merge(businesses, calls14, by.x = "Address2", by.y = "Address", all.x = T)
+#names(test2)
+# Remove duplicates
+test2 <- test2[order(test2$PIN.x),]
+test2 <- test2[!duplicated(test2[,1:148]), ]
+#View(test2[,100:ncol(test2)])
+dim(test2)
+#names(test2)
+names(test2)[150:154] <- c("Auto911_14Buffer", "Fire911_14Buffer", "Prop911_14Buffer", "Violent911_14Buffer", "Misc911_14Buffer")
+# Subset out columns to merge with businesses
+test2 <- test2[order(test2$PIN.x),]
+keepcols <- c(150:154)
+test14buff <- test2[,keepcols]
+
+
+
+# 2015 on location 911 calls
+calls15 <- read.csv("calls15Join.csv", head = T)
+#names(calls15)
+keepcols <- c(6, 11, 21:25)
+calls15 <- calls15[,keepcols]
+#View(calls15)
+# Merge with businesses
+test <- merge(businesses, calls15, by.x = "Address2", by.y = "Address", all.x = T)
+#names(test)
+# Remove duplicates
+test <- test[order(test$PIN.x),]
+test <- test[!duplicated(test[,1:148]), ]
+#View(test[,100:ncol(test)])
+dim(test)
+#names(test)
+names(test)[150:154] <- c("Auto911_15", "Fire911_15", "Property911_15", "Violent911_15", "Misc911_15")
+# Subset out columns to merge with businesses
+test <- test[order(test$PIN.x),]
+keepcols <- c(150:154)
+test15 <- test[,keepcols]
+
+# 2015 within 500' buffer 911 calls
+calls15 <- read.csv("calls15JoinBuffer.csv", head = T)
+#names(calls15)
+keepcols <- c(6, 11, 23:27)
+calls15 <- calls15[,keepcols]
+#View(calls15)
+# Merge with businesses
+test2 <- merge(businesses, calls15, by.x = "Address2", by.y = "Address", all.x = T)
+#names(test2)
+# Remove duplicates
+test2 <- test2[order(test2$PIN.x),]
+test2 <- test2[!duplicated(test2[,1:148]), ]
+#View(test2[,100:ncol(test2)])
+dim(test2)
+#names(test2)
+names(test2)[150:154] <- c("Auto911_15Buffer", "Fire911_15Buffer", "Prop911_15Buffer", "Violent911_15Buffer", "Misc911_15Buffer")
+# Subset out columns to merge with businesses
+test2 <- test2[order(test2$PIN.x),]
+keepcols <- c(150:154)
+test15buff <- test2[,keepcols]
+
+
+
+# 2016 on location 911 calls
+calls16 <- read.csv("calls16Join.csv", head = T)
+#names(calls16)
+keepcols <- c(6, 11, 21:25)
+calls16 <- calls16[,keepcols]
+#View(calls16)
+# Merge with businesses
+test <- merge(businesses, calls16, by.x = "Address2", by.y = "Address", all.x = T)
+#names(test)
+# Remove duplicates
+test <- test[order(test$PIN.x),]
+test <- test[!duplicated(test[,1:148]), ]
+#View(test[,100:ncol(test)])
+dim(test)
+#names(test)
+names(test)[150:154] <- c("Auto911_16", "Fire911_16", "Property911_16", "Violent911_16", "Misc911_16")
+# Subset out columns to merge with businesses
+test <- test[order(test$PIN.x),]
+keepcols <- c(150:154)
+test16 <- test[,keepcols]
+
+# 2016 within 500' buffer 911 calls
+calls16 <- read.csv("calls16JoinBuffer.csv", head = T)
+#names(calls16)
+keepcols <- c(6, 11, 23:27)
+calls16 <- calls16[,keepcols]
+#View(calls16)
+# Merge with businesses
+test2 <- merge(businesses, calls16, by.x = "Address2", by.y = "Address", all.x = T)
+#names(test2)
+# Remove duplicates
+test2 <- test2[order(test2$PIN.x),]
+test2 <- test2[!duplicated(test2[,1:148]), ]
+#View(test2[,100:ncol(test2)])
+dim(test2)
+#names(test2)
+names(test2)[150:154] <- c("Auto911_16Buffer", "Fire911_16Buffer", "Prop911_16Buffer", "Violent911_16Buffer", "Misc911_16Buffer")
+# Subset out columns to merge with businesses
+test2 <- test2[order(test2$PIN.x),]
+keepcols <- c(150:154)
+test16buff <- test2[,keepcols]
+
+# Cbind altogether with businesses
+
+businesses <- cbind(businesses, test12, test12buff, test13, test13buff, test14, test14buff, test15, test15buff, test16, test16buff)
+#View(businesses)
+
+
+```
+
+
+
+
+
+
+
+# MODEL #
+With all of the data preparation activities done, now it is time to run a few different models. Notes and code for this step is included below.
+
+```{r}
+
+## Model
+# Will need to select out subset of variables for each prediction iteration
+# All non-time-related variables + Y specifics 
+# For example, for predicting 2014 inactives, we'll need inactive14, active 14,
+# NumEnf13, Crimes13, Delinquent13, TV13, etc.
+
+
+# Test complete.cases to see how many that leaves us with?
+
+#names(businesses)
+
+# Adjust data to be suitable for various Models
+businesses$Inactive <- as.factor(businesses$Inactive)
+businesses$Inactive <- ifelse(is.na(businesses$Inactive), 0, 1)
+businesses$PIN <- as.factor(businesses$PIN)
+businesses$DDA <- as.factor(ifelse(businesses$DDA == "DDA", 1, 0))
+businesses$TIF <- as.factor(ifelse(businesses$TIF == "TIF", 1, 0))
+businesses$NumEnf13 <- ifelse(is.na(businesses$NumEnf13), 0, businesses$NumEnf13)
+businesses$NumEnf14 <- ifelse(is.na(businesses$NumEnf14), 0, businesses$NumEnf14)
+businesses$NumEnf15 <- ifelse(is.na(businesses$NumEnf15), 0, businesses$NumEnf15)
+businesses$NumEnf16 <- ifelse(is.na(businesses$NumEnf16), 0, businesses$NumEnf16)
+businesses$NumPerm13 <- ifelse(is.na(businesses$NumPerm13), 0, businesses$NumPerm13)
+businesses$NumPerm14 <- ifelse(is.na(businesses$NumPerm14), 0, businesses$NumPerm14)
+businesses$NumPerm15 <- ifelse(is.na(businesses$NumPerm15), 0, businesses$NumPerm15)
+businesses$NumPerm16 <- ifelse(is.na(businesses$NumPerm16), 0, businesses$NumPerm16)
+businesses$BilledSumPerm13 <- ifelse(is.na(businesses$BilledSumPerm13), 0, businesses$BilledSumPerm13)
+businesses$BilledSumPerm14 <- ifelse(is.na(businesses$BilledSumPerm14), 0, businesses$BilledSumPerm14)
+businesses$BilledSumPerm15 <- ifelse(is.na(businesses$BilledSumPerm15), 0, businesses$BilledSumPerm15)
+businesses$BilledSumPerm16 <- ifelse(is.na(businesses$BilledSumPerm16), 0, businesses$BilledSumPerm16)
+businesses$TotalInsp13 <- ifelse(is.na(businesses$TotalInsp13), 0, businesses$TotalInsp13)
+businesses$TotalInsp14 <- ifelse(is.na(businesses$TotalInsp14), 0, businesses$TotalInsp14)
+businesses$TotalInsp15 <- ifelse(is.na(businesses$TotalInsp15), 0, businesses$TotalInsp15)
+businesses$TotalInsp16 <- ifelse(is.na(businesses$TotalInsp16), 0, businesses$TotalInsp16)
+businesses$InspFail13 <- ifelse(is.na(businesses$InspFail13), 0, businesses$InspFail13)
+businesses$InspFail14 <- ifelse(is.na(businesses$InspFail14), 0, businesses$InspFail14)
+businesses$InspFail15 <- ifelse(is.na(businesses$InspFail15), 0, businesses$InspFail15)
+businesses$InspFail16 <- ifelse(is.na(businesses$InspFail16), 0, businesses$InspFail16)
+businesses$PercFailed13 <- ifelse(is.na(businesses$PercFailed13), 0, businesses$PercFailed13)
+businesses$PercFailed14 <- ifelse(is.na(businesses$PercFailed14), 0, businesses$PercFailed14)
+businesses$PercFailed15 <- ifelse(is.na(businesses$PercFailed15), 0, businesses$PercFailed15)
+businesses$PercFailed16 <- ifelse(is.na(businesses$PercFailed16), 0, businesses$PercFailed16)
+businesses$SEV13 <- ifelse(is.na(businesses$SEV13), 0, businesses$SEV13)
+businesses$SEV14 <- ifelse(is.na(businesses$SEV14), 0, businesses$SEV14)
+businesses$SEV15 <- ifelse(is.na(businesses$SEV15), 0, businesses$SEV15)
+businesses$SEV16 <- ifelse(is.na(businesses$SEV16), 0, businesses$SEV16)
+businesses$TV13 <- ifelse(is.na(businesses$TV13), 0, businesses$TV13)
+businesses$TV14 <- ifelse(is.na(businesses$TV14), 0, businesses$TV14)
+businesses$TV15 <- ifelse(is.na(businesses$TV15), 0, businesses$TV15)
+businesses$TV16 <- ifelse(is.na(businesses$TV16), 0, businesses$TV16)
+businesses$Zoning13 <- as.factor(ifelse(is.na(businesses$Zoning13), "", businesses$Zoning13))
+businesses$Zoning14 <- as.factor(ifelse(is.na(businesses$Zoning14), "", businesses$Zoning14))
+businesses$Zoning15 <- as.factor(ifelse(is.na(businesses$Zoning15), "", businesses$Zoning15))
+businesses$Zoning16 <- as.factor(ifelse(is.na(businesses$Zoning16), "", businesses$Zoning16))
+businesses$OwnerKzoo13 <- ifelse(is.na(businesses$OwnerKzoo13), 0, businesses$OwnerKzoo13)
+businesses$OwnerKzoo14 <- ifelse(is.na(businesses$OwnerKzoo14), 0, businesses$OwnerKzoo14)
+businesses$OwnerKzoo15 <- ifelse(is.na(businesses$OwnerKzoo15), 0, businesses$OwnerKzoo15)
+businesses$OwnerKzoo16 <- ifelse(is.na(businesses$OwnerKzoo16), 0, businesses$OwnerKzoo16)
+businesses$OwnerChange13_14 <- ifelse(is.na(businesses$OwnerChange13_14), 0, businesses$OwnerChange13_14)
+businesses$OwnerChange14_15 <- ifelse(is.na(businesses$OwnerChange14_15), 0, businesses$OwnerChange14_15)
+businesses$OwnerChange15_16 <- ifelse(is.na(businesses$OwnerChange15_16), 0, businesses$OwnerChange15_16)
+businesses$SEVGrowth13_14 <- ifelse(is.na(businesses$SEVGrowth13_14), 0, businesses$SEVGrowth13_14)
+businesses$SEVGrowth14_15 <- ifelse(is.na(businesses$SEVGrowth14_15), 0, businesses$SEVGrowth14_15)
+businesses$SEVGrowth15_16 <- ifelse(is.na(businesses$SEVGrowth15_16), 0, businesses$SEVGrowth15_16)
+businesses$TVGrowth13_14 <- ifelse(is.na(businesses$TVGrowth13_14), 0, businesses$TVGrowth13_14)
+businesses$TVGrowth14_15 <- ifelse(is.na(businesses$TVGrowth14_15), 0, businesses$TVGrowth14_15)
+businesses$TVGrowth15_16 <- ifelse(is.na(businesses$TVGrowth15_16), 0, businesses$TVGrowth15_16)
+businesses$ZoningChange13_14 <- ifelse(is.na(businesses$ZoningChange13_14), 0, businesses$ZoningChange13_14)
+businesses$ZoningChange14_15 <- ifelse(is.na(businesses$ZoningChange14_15), 0, businesses$ZoningChange14_15)
+businesses$ZoningChange15_16 <- ifelse(is.na(businesses$ZoningChange15_16), 0, businesses$ZoningChange15_16)
+businesses$DelinquentPP13 <- ifelse(is.na(businesses$DelinquentPP13), 0, 1)
+businesses$DelinquentPP14 <- ifelse(is.na(businesses$DelinquentPP14), 0, 1)
+businesses$DelinquentPP15 <- ifelse(is.na(businesses$DelinquentPP15), 0, 1)
+businesses$DelinquentPP16 <- ifelse(is.na(businesses$DelinquentPP16), 0, 1)
+businesses$Violent911_12 <- ifelse(is.na(businesses$Violent911_12), 0, businesses$Violent911_12)
+businesses$Misc911_12 <- ifelse(is.na(businesses$Misc911_12), 0, businesses$Misc911_12)
+businesses$Auto911_12 <- ifelse(is.na(businesses$Auto911_12), 0, businesses$Auto911_12)
+businesses$Fire911_12 <- ifelse(is.na(businesses$Fire911_12), 0, businesses$Fire911_12)
+businesses$Property911_12 <- ifelse(is.na(businesses$Property911_12), 0, businesses$Property911_12)
+businesses$Violent911_12Buffer <- ifelse(is.na(businesses$Violent911_12Buffer), 0, businesses$Violent911_12Buffer)
+businesses$Misc911_12Buffer <- ifelse(is.na(businesses$Misc911_12Buffer), 0, businesses$Misc911_12Buffer)
+businesses$Auto911_12Buffer <- ifelse(is.na(businesses$Auto911_12Buffer), 0, businesses$Auto911_12Buffer)
+businesses$Fire911_12Buffer <- ifelse(is.na(businesses$Fire911_12Buffer), 0, businesses$Fire911_12Buffer)
+businesses$Prop911_12Buffer <- ifelse(is.na(businesses$Prop911_12Buffer), 0, businesses$Prop911_12Buffer)
+
+businesses$Violent911_13 <- ifelse(is.na(businesses$Violent911_13), 0, businesses$Violent911_13)
+businesses$Misc911_13 <- ifelse(is.na(businesses$Misc911_13), 0, businesses$Misc911_13)
+businesses$Auto911_13 <- ifelse(is.na(businesses$Auto911_13), 0, businesses$Auto911_13)
+businesses$Fire911_13 <- ifelse(is.na(businesses$Fire911_13), 0, businesses$Fire911_13)
+businesses$Property911_13 <- ifelse(is.na(businesses$Property911_13), 0, businesses$Property911_13)
+businesses$Violent911_13Buffer <- ifelse(is.na(businesses$Violent911_13Buffer), 0, businesses$Violent911_13Buffer)
+businesses$Misc911_13Buffer <- ifelse(is.na(businesses$Misc911_13Buffer), 0, businesses$Misc911_13Buffer)
+businesses$Auto911_13Buffer <- ifelse(is.na(businesses$Auto911_13Buffer), 0, businesses$Auto911_13Buffer)
+businesses$Fire911_13Buffer <- ifelse(is.na(businesses$Fire911_13Buffer), 0, businesses$Fire911_13Buffer)
+businesses$Prop911_13Buffer <- ifelse(is.na(businesses$Prop911_13Buffer), 0, businesses$Prop911_13Buffer)
+
+businesses$Violent911_14 <- ifelse(is.na(businesses$Violent911_14), 0, businesses$Violent911_14)
+businesses$Misc911_14 <- ifelse(is.na(businesses$Misc911_14), 0, businesses$Misc911_14)
+businesses$Auto911_14 <- ifelse(is.na(businesses$Auto911_14), 0, businesses$Auto911_14)
+businesses$Fire911_14 <- ifelse(is.na(businesses$Fire911_14), 0, businesses$Fire911_14)
+businesses$Property911_14 <- ifelse(is.na(businesses$Property911_14), 0, businesses$Property911_14)
+businesses$Violent911_14Buffer <- ifelse(is.na(businesses$Violent911_14Buffer), 0, businesses$Violent911_14Buffer)
+businesses$Misc911_14Buffer <- ifelse(is.na(businesses$Misc911_14Buffer), 0, businesses$Misc911_14Buffer)
+businesses$Auto911_14Buffer <- ifelse(is.na(businesses$Auto911_14Buffer), 0, businesses$Auto911_14Buffer)
+businesses$Fire911_14Buffer <- ifelse(is.na(businesses$Fire911_14Buffer), 0, businesses$Fire911_14Buffer)
+businesses$Prop911_14Buffer <- ifelse(is.na(businesses$Prop911_14Buffer), 0, businesses$Prop911_14Buffer)
+
+businesses$Violent911_15 <- ifelse(is.na(businesses$Violent911_15), 0, businesses$Violent911_15)
+businesses$Misc911_15 <- ifelse(is.na(businesses$Misc911_15), 0, businesses$Misc911_15)
+businesses$Auto911_15 <- ifelse(is.na(businesses$Auto911_15), 0, businesses$Auto911_15)
+businesses$Fire911_15 <- ifelse(is.na(businesses$Fire911_15), 0, businesses$Fire911_15)
+businesses$Property911_15 <- ifelse(is.na(businesses$Property911_15), 0, businesses$Property911_15)
+businesses$Violent911_15Buffer <- ifelse(is.na(businesses$Violent911_15Buffer), 0, businesses$Violent911_15Buffer)
+businesses$Misc911_15Buffer <- ifelse(is.na(businesses$Misc911_15Buffer), 0, businesses$Misc911_15Buffer)
+businesses$Auto911_15Buffer <- ifelse(is.na(businesses$Auto911_15Buffer), 0, businesses$Auto911_15Buffer)
+businesses$Fire911_15Buffer <- ifelse(is.na(businesses$Fire911_15Buffer), 0, businesses$Fire911_15Buffer)
+businesses$Prop911_15Buffer <- ifelse(is.na(businesses$Prop911_15Buffer), 0, businesses$Prop911_15Buffer)
+
+businesses$Violent911_16 <- ifelse(is.na(businesses$Violent911_16), 0, businesses$Violent911_16)
+businesses$Misc911_16 <- ifelse(is.na(businesses$Misc911_16), 0, businesses$Misc911_16)
+businesses$Auto911_16 <- ifelse(is.na(businesses$Auto911_16), 0, businesses$Auto911_16)
+businesses$Fire911_16 <- ifelse(is.na(businesses$Fire911_16), 0, businesses$Fire911_16)
+businesses$Property911_16 <- ifelse(is.na(businesses$Property911_16), 0, businesses$Property911_16)
+businesses$Violent911_16Buffer <- ifelse(is.na(businesses$Violent911_16Buffer), 0, businesses$Violent911_16Buffer)
+businesses$Misc911_16Buffer <- ifelse(is.na(businesses$Misc911_16Buffer), 0, businesses$Misc911_16Buffer)
+businesses$Auto911_16Buffer <- ifelse(is.na(businesses$Auto911_16Buffer), 0, businesses$Auto911_16Buffer)
+businesses$Fire911_16Buffer <- ifelse(is.na(businesses$Fire911_16Buffer), 0, businesses$Fire911_16Buffer)
+businesses$Prop911_16Buffer <- ifelse(is.na(businesses$Prop911_16Buffer), 0, businesses$Prop911_16Buffer)
+
+
+```
+
+
+
+
+
+
+### MODEL WORK ###
+```{r}
+
+
+dim(businesses)
+
+# Dataset to predict 2014 inactives, using 2013 data
+businesses14 <- subset(businesses, businesses$Active14 == 1 | businesses$Inactive14 == 1)
+#names(businesses14)
+keepcols <- c(1:18, 37:38, 42, 53, 55, 61, 67:68, 78:80, 92, 100:106, 129, 134, 143:144, 159:168)
+businesses14 <- businesses14[,keepcols]
+#View(businesses14)
+#str(businesses14)
+
+# Only keep numeric
+#names(businesses14)
+keepcols <- c(19:20, 22:29, 35:36, 38:51)
+businesses14_2 <- businesses14[,keepcols]
+str(businesses14_2)
+dim(businesses14_2)
+names(businesses14_2)
+
+# Exploratory analysis of 2014
+active14 <- subset(businesses14_2, businesses14_2$Inactive == 0)
+inactive14 <- subset(businesses14_2, businesses14_2$Inactive == 1)
+summary(active14)
+summary(inactive14)
+# Delinquent
+#prop.table(aggregate(DDA ~ DelinquentPP13, data = active14, FUN = length))
+#prop.table(aggregate(DDA ~ DelinquentPP13, data = inactive14, FUN = length))
+# SEV Increase
+#prop.table(aggregate(DDA ~ SEVGrowth13_14, data = active14, FUN = length))
+#prop.table(aggregate(DDA ~ SEVGrowth13_14, data = inactive14, FUN = length))
+# TV Increase
+#prop.table(aggregate(DDA ~ TVGrowth13_14, data = active14, FUN = length))
+#prop.table(aggregate(DDA ~ TVGrowth13_14, data = inactive14, FUN = length))
+# Kzoo Owners
+#prop.table(aggregate(DDA ~ OwnerKzoo13, data = active14, FUN = length))
+#prop.table(aggregate(DDA ~ OwnerKzoo13, data = inactive14, FUN = length))
+#Ownership Changes
+#prop.table(aggregate(DDA ~ OwnerChange13_14, data = active14, FUN = length))
+#prop.table(aggregate(DDA ~ OwnerChange13_14, data = inactive14, FUN = length))
+
+class(businesses14_2)
+
+# Normalize the data, 
+businesses14_2 <- sapply(businesses14_2, as.numeric)
+businesses14_2[,4:26] <- scale(businesses14_2[,4:26])
+businesses14_2 <- as.data.frame(businesses14_2)
+summary(businesses14_2)
+
+
+
+
+# Dataset to predict 2015 inactives, using 2014 data
+businesses15 <- subset(businesses, businesses$Active15 == 1 | businesses$Active14 == 1 | businesses$Inactive15 == 1)
+keepcols <- c(1:18, 37:38, 42, 53, 56, 62, 69:70, 81:83, 92, 107:113, 130, 135, 145:146, 169:178)
+businesses15 <- businesses15[,keepcols]
+#str(businesses15)
+#names(businesses15)
+keepcols <- c(19:20, 22:29, 35:36, 38:51)
+businesses15_2 <- businesses15[,keepcols]
+#str(businesses15_2)
+dim(businesses15_2)
+
+# Exploratory analysis of 2015
+active15 <- subset(businesses15_2, businesses15_2$Inactive == 0)
+inactive15 <- subset(businesses15_2, businesses15_2$Inactive == 1)
+summary(active15)
+summary(inactive15)
+# Delinquent
+#prop.table(aggregate(DDA ~ DelinquentPP14, data = active15, FUN = length))
+#prop.table(aggregate(DDA ~ DelinquentPP14, data = inactive15, FUN = length))
+# SEV Increase
+#prop.table(aggregate(DDA ~ SEVGrowth14_15, data = active15, FUN = length))
+#prop.table(aggregate(DDA ~ SEVGrowth14_15, data = inactive15, FUN = length))
+# TV Increase
+#prop.table(aggregate(DDA ~ TVGrowth14_15, data = active15, FUN = length))
+#prop.table(aggregate(DDA ~ TVGrowth14_15, data = inactive15, FUN = length))
+# Kzoo Owners
+#prop.table(aggregate(DDA ~ OwnerKzoo14, data = active15, FUN = length))
+#prop.table(aggregate(DDA ~ OwnerKzoo14, data = inactive15, FUN = length))
+#Ownership Changes
+#prop.table(aggregate(DDA ~ OwnerChange14_15, data = active15, FUN = length))
+#prop.table(aggregate(DDA ~ OwnerChange14_15, data = inactive15, FUN = length))
+
+# Normalize the data, 
+businesses15_2 <- sapply(businesses15_2, as.numeric)
+businesses15_2[,4:26] <- scale(businesses15_2[,4:26])
+businesses15_2 <- as.data.frame(businesses15_2)
+summary(businesses15_2)
+
+
+
+
+# Dataset to predict 2016 inactives, using 2015 data
+businesses16 <- subset(businesses, businesses$Active16 == 1 | businesses$Active15 == 1 | businesses$Active14 == 1 | businesses$Inactive.16 == 1)
+keepcols <- c(1:18, 37:38, 42, 53, 57, 63, 71:72, 84:86, 93, 114:120, 131, 136, 147:148, 179:188)
+businesses16 <- businesses16[,keepcols]
+dim(businesses16)
+#str(businesses16)
+#names(businesses16)
+keepcols <- c(19:20, 22:29, 35:36, 38:51)
+businesses16_2 <- businesses16[,keepcols]
+#str(businesses16_2)
+dim(businesses16_2)
+
+# Exploratory analysis of 2016
+active16 <- subset(businesses16_2, businesses16_2$Inactive == 0)
+inactive16 <- subset(businesses16_2, businesses16_2$Inactive == 1)
+summary(active16)
+summary(inactive16)
+# Delinquent
+#prop.table(aggregate(DDA ~ DelinquentPP15, data = active16, FUN = length))
+#prop.table(aggregate(DDA ~ DelinquentPP15, data = inactive16, FUN = length))
+# SEV Increase
+#prop.table(aggregate(DDA ~ SEVGrowth15_16, data = active16, FUN = length))
+#prop.table(aggregate(DDA ~ SEVGrowth15_16, data = inactive16, FUN = length))
+# TV Increase
+#prop.table(aggregate(DDA ~ TVGrowth15_16, data = active16, FUN = length))
+#prop.table(aggregate(DDA ~ TVGrowth15_16, data = inactive16, FUN = length))
+# Kzoo Owners
+#prop.table(aggregate(DDA ~ OwnerKzoo15, data = active16, FUN = length))
+#prop.table(aggregate(DDA ~ OwnerKzoo15, data = inactive16, FUN = length))
+#Ownership Changes
+#prop.table(aggregate(DDA ~ OwnerChange15_16, data = active16, FUN = length))
+#prop.table(aggregate(DDA ~ OwnerChange15_16, data = inactive16, FUN = length))
+
+# Normalize the data, 
+businesses16_2 <- sapply(businesses16_2, as.numeric)
+businesses16_2[,4:26] <- scale(businesses16_2[,4:26])
+businesses16_2 <- as.data.frame(businesses16_2)
+summary(businesses16_2)
+
+
+```
+
+
+
+### LOGIT MODEL TEST ###
+
+```{r}
+
+library(pscl)
+library(ROCR)
+library(caret)
+library(InformationValue)
+# 2014 Prediction
+table(as.factor(businesses14_2$Inactive))
+
+smp_size <- nrow(businesses14_2) * .8
+set.seed(123)
+train_n <- sample(seq_len(nrow(businesses14_2)), size = smp_size)
+
+train <- businesses14_2[train_n,]
+test <- businesses14_2[-train_n,]
+head(test)
+model <- glm(Inactive ~ ., family = binomial(link = 'logit'), data = train)
+
+summary(model)
+anova(model, test = "Chisq")
+pR2(model)
+# McFadden of .128
+
+# Predictive ability of Logit model
+fitted.results <- predict(model, newdata = subset(test, select = -Inactive))
+fitted.results <- ifelse(fitted.results > 0.5, 1, 0)
+misClasificError <- mean(fitted.results != test$Inactive)
+print(paste('Accuracy', 1-misClasificError))
+# 91% accuracy, not super impressive since that's roughly equivalent to simply guessing 
+# All actives and misclassifying all inactives
+
+# ROC Curve and AUC
+p <- predict(model, newdata = subset(test, select= -Inactive), type = "response")
+pr <- prediction(p, test$Inactive)
+prf <- performance(pr, measure = "tpr", x.measure = "fpr")
+plot(prf)
+
+auc <- performance(pr, measure = "auc")
+auc <- auc@y.values[[1]]
+auc
+# Plot the AUC
+plotROC(test$Inactive, p)
+
+# AUC of 0.6 is not that great, closer to 1.0 would be ideal
+# https://datascienceplus.com/perform-logistic-regression-in-r/
+
+
+# Let's fine tune the model a bit
+# https://hopstat.wordpress.com/2014/12/19/a-small-introduction-to-the-rocr-package/ 
+
+# Optimal cutoff to optimize both 1s and 0s classification
+optCutOff <- optimalCutoff(test$Inactive, p, optimiseFor = "Both", returnDiagnostics = TRUE)[1]
+optCutOff
+
+# Find ideal cutoff point to optimize recall/sensitivity
+acc.perf = performance(pr, measure = "rec")
+plot(acc.perf)
+ind = which.max(slot(acc.perf, "y.values")[[1]])
+acc = slot(acc.perf, "y.values")[[1]][ind]
+cutoff = slot(acc.perf, "x.values")[[1]][ind]
+print(c(recall = acc, cutoff = cutoff))
+
+
+# Evaluate both "optimal" cutoff points, one to optimize Recall, one to optimize both Recall and Precision
+# Sensitivity, True Positive Rate, proportion of positives (Inactives) that are correctly identified as such
+sens1 <- sensitivity(test$Inactive, p, threshold = cutoff)
+sens2 <- sensitivity(test$Inactive, p, threshold = optCutOff)
+sens1
+sens2
+# Specificity, True Negative Rate, proportion of negatives (actives) correctly identified as such
+spec1 <- specificity(test$Inactive, p, threshold = cutoff)
+spec2 <- specificity(test$Inactive, p, threshold = optCutOff)
+spec1
+spec2
+# Precision, Percentage of predicted inactives that are actually inactive
+prec1 <- precision(test$Inactive, p, threshold = cutoff)
+prec2 <- precision(test$Inactive, p, threshold = optCutOff)
+prec1
+prec2
+# CM
+confusionMatrix(test$Inactive, p, threshold = cutoff)
+confusionMatrix(test$Inactive, p, threshold = optCutOff)
+
+#Accuracy, fraction of total sample that was correctly predicted
+accu1 <- 1-misClassError(test$Inactive, p, threshold = cutoff)
+accu2 <- 1-misClassError(test$Inactive, p, threshold = optCutOff)
+accu1
+accu2
+# F1 Score
+F1_1 <- (2 * prec1 * sens1) / (prec1 + sens1)
+F1_2 <- (2 * prec2 * sens2) / (prec2 + sens2)
+F1_1
+F1_2
+
+
+
+
+
+# 2015 Prediction
+table(businesses15_2$Inactive)
+
+smp_size <- nrow(businesses15_2) * .8
+set.seed(123)
+train_n <- sample(seq_len(nrow(businesses15_2)), size = smp_size)
+
+train <- businesses15_2[train_n,]
+test <- businesses15_2[-train_n,]
+head(test)
+model <- glm(Inactive ~ ., family = binomial(link = 'logit'), data = train)
+
+summary(model)
+anova(model, test = "Chisq")
+pR2(model)
+# McFadden of 0.09
+
+# Predictive ability of Logit model
+fitted.results <- predict(model, newdata = subset(test, select = -Inactive))
+fitted.results <- ifelse(fitted.results > 0.5, 1, 0)
+misClasificError <- mean(fitted.results != test$Inactive)
+print(paste('Accuracy', 1-misClasificError))
+# 94% accuracy, not super impressive since that's roughly equivalent to simply guessing 
+# All actives and misclassifying all inactives
+
+# ROC Curve and AUC
+p <- predict(model, newdata = subset(test, select= -Inactive), type = "response")
+pr <- prediction(p, test$Inactive)
+prf <- performance(pr, measure = "tpr", x.measure = "fpr")
+plot(prf)
+
+auc <- performance(pr, measure = "auc")
+auc <- auc@y.values[[1]]
+auc
+# AUC of 0.31 is not great, closer to 1.0 would be ideal
+# https://datascienceplus.com/perform-logistic-regression-in-r/
+# Plot the AUC
+plotROC(test$Inactive, p)
+
+
+# Let's fine tune the model a bit
+# https://hopstat.wordpress.com/2014/12/19/a-small-introduction-to-the-rocr-package/ 
+
+# Optimal cutoff to optimize Ones
+optCutOff <- optimalCutoff(test$Inactive, p, optimiseFor = "Ones", returnDiagnostics = TRUE)[1]
+optCutOff
+
+# Find ideal cutoff point to optimize recall/sensitivity
+acc.perf = performance(pr, measure = "rec")
+plot(acc.perf)
+ind = which.max(slot(acc.perf, "y.values")[[1]])
+acc = slot(acc.perf, "y.values")[[1]][ind]
+cutoff = slot(acc.perf, "x.values")[[1]][ind]
+print(c(recall = acc, cutoff = cutoff))
+
+
+# Evaluate both "optimal" cutoff points, one to optimize Recall, one to optimize both Recall and Precision
+# Sensitivity, True Positive Rate, proportion of positives (Inactives) that are correctly identified as such
+sens1 <- sensitivity(test$Inactive, p, threshold = cutoff)
+sens2 <- sensitivity(test$Inactive, p, threshold = optCutOff)
+sens1
+sens2
+
+# Specificity, True Negative Rate, proportion of negatives (actives) correctly identified as such
+spec1 <- specificity(test$Inactive, p, threshold = cutoff)
+spec2 <- specificity(test$Inactive, p, threshold = optCutOff)
+spec1
+spec2
+# Precision, Percentage of predicted inactives that are actually inactive
+prec1 <- precision(test$Inactive, p, threshold = cutoff)
+prec2 <- precision(test$Inactive, p, threshold = optCutOff)
+prec1
+prec2
+
+# CM
+confusionMatrix(test$Inactive, p, threshold = cutoff)
+confusionMatrix(test$Inactive, p, threshold = optCutOff)
+
+#Accuracy, fraction of total sample that was correctly predicted
+accu1 <- 1-misClassError(test$Inactive, p, threshold = cutoff)
+accu2 <- 1-misClassError(test$Inactive, p, threshold = optCutOff)
+accu1
+accu2
+# F1 Score
+F1_1 <- (2 * prec1 * sens1) / (prec1 + sens1)
+F1_2 <- (2 * prec2 * sens2) / (prec2 + sens2)
+F1_1
+F1_2
+
+
+
+
+
+# 2016 Prediction
+table(businesses16_2$Inactive)
+
+smp_size <- nrow(businesses16_2) * .8
+set.seed(123)
+train_n <- sample(seq_len(nrow(businesses16_2)), size = smp_size)
+
+train <- businesses16_2[train_n,]
+test <- businesses16_2[-train_n,]
+head(test)
+model <- glm(Inactive ~ ., family = binomial(link = 'logit'), data = train)
+
+summary(model)
+anova(model, test = "Chisq")
+pR2(model)
+#McFadden of .131
+
+# Predictive ability of Logit model
+fitted.results <- predict(model, newdata = subset(test, select = -Inactive))
+fitted.results <- ifelse(fitted.results > 0.5, 1, 0)
+misClasificError <- mean(fitted.results != test$Inactive)
+print(paste('Accuracy', 1-misClasificError))
+# 97% accuracy, not super impressive since that's roughly equivalent to simply guessing 
+# All actives and misclassifying all inactives
+
+# ROC Curve and AUC
+p <- predict(model, newdata = subset(test, select= -Inactive), type = "response")
+pr <- prediction(p, test$Inactive)
+prf <- performance(pr, measure = "tpr", x.measure = "fpr")
+plot(prf)
+
+
+auc <- performance(pr, measure = "auc")
+auc <- auc@y.values[[1]]
+auc
+# AUC of 0.31 is not great, closer to 1.0 would be ideal
+# https://datascienceplus.com/perform-logistic-regression-in-r/
+
+# Plot the AUC
+plotROC(test$Inactive, p)
+
+
+# Let's fine tune the model a bit
+# https://hopstat.wordpress.com/2014/12/19/a-small-introduction-to-the-rocr-package/ 
+
+# Optimal cutoff to optimize Ones
+optCutOff <- optimalCutoff(test$Inactive, p, optimiseFor = "Ones", returnDiagnostics = TRUE)[1]
+optCutOff
+
+# Find ideal cutoff point to optimize recall/sensitivity
+acc.perf = performance(pr, measure = "rec")
+plot(acc.perf)
+ind = which.max(slot(acc.perf, "y.values")[[1]])
+acc = slot(acc.perf, "y.values")[[1]][ind]
+cutoff = slot(acc.perf, "x.values")[[1]][ind]
+print(c(recall = acc, cutoff = cutoff))
+
+
+# Evaluate both "optimal" cutoff points, one to optimize Recall, one to optimize both Recall and Precision
+# Sensitivity, True Positive Rate, proportion of positives (Inactives) that are correctly identified as such
+sens1 <- sensitivity(test$Inactive, p, threshold = cutoff)
+sens2 <- sensitivity(test$Inactive, p, threshold = optCutOff)
+sens1
+sens2
+
+# Specificity, True Negative Rate, proportion of negatives (actives) correctly identified as such
+spec1 <- specificity(test$Inactive, p, threshold = cutoff)
+spec2 <- specificity(test$Inactive, p, threshold = optCutOff)
+spec1
+spec2
+# Precision, Percentage of predicted inactives that are actually inactive
+prec1 <- precision(test$Inactive, p, threshold = cutoff)
+prec2 <- precision(test$Inactive, p, threshold = optCutOff)
+prec1
+prec2
+
+# CM
+confusionMatrix(test$Inactive, p, threshold = cutoff)
+confusionMatrix(test$Inactive, p, threshold = optCutOff)
+
+#Accuracy, fraction of total sample that was correctly predicted
+accu1 <- 1-misClassError(test$Inactive, p, threshold = cutoff)
+accu2 <- 1-misClassError(test$Inactive, p, threshold = optCutOff)
+accu1
+accu2
+# F1 Score
+F1_1 <- (2 * prec1 * sens1) / (prec1 + sens1)
+F1_2 <- (2 * prec2 * sens2) / (prec2 + sens2)
+F1_1
+F1_2
+
+```
+
+
+
+
+
+## One Class SVM Test
+```{r}
+#####NEEED TO IMPROVE THIS PIECE, HOW TO EVALUATE? DO WE USE ACTIVE as ONE-CLASS OR INACTIVE?
+# EVALUATION == PRECISION, RECALL, FP, F1
+
+## One Class SVM TEST
+# 2014
+library(e1071)
+data <- subset(businesses14_2, Inactive == 0)
+data[] <- lapply(data, function(x) as.numeric(as.character(x)))
+#str(data)
+
+x <- subset(data, select = -Inactive)
+y <- data$Inactive
+model <- svm(x, y, type = 'one-classification')
+
+print(model)
+summary(model)
+
+pred <- predict(model, subset(businesses14_2, select = -Inactive))
+#pred
+
+## Evaluate
+# Sensitivity
+sens1 <- sensitivity(businesses14_2$Inactive, pred)
+sens1
+
+# Specificity
+spec1 <- specificity(businesses14_2$Inactive, pred)
+spec1
+
+# Precision
+prec1 <- precision(businesses14_2$Inactive, pred)
+prec1
+
+# Accuracy
+accu1 <- 1- misClassError(businesses14_2$Inactive, pred)
+accu1
+
+# Confusion Matrix
+table(predicted = pred, reference = businesses14_2$Inactive)
+
+# F1 Score
+F1_1 <- (2 * prec1 * sens1) / (prec1 + sens1)
+F1_1
+
+
+
+
+
+# 2015
+
+data <- subset(businesses15_2, Inactive == 0)
+data[] <- lapply(data, function(x) as.numeric(as.character(x)))
+#str(data)
+
+x <- subset(data, select = -Inactive)
+y <- data$Inactive
+model <- svm(x, y, type = 'one-classification')
+
+print(model)
+summary(model)
+
+pred <- predict(model, subset(businesses15_2, select = -Inactive))
+#pred
+
+## Evaluate
+# Sensitivity
+sens1 <- sensitivity(businesses15_2$Inactive, pred)
+sens1
+
+# Specificity
+spec1 <- specificity(businesses15_2$Inactive, pred)
+spec1
+
+# Precision
+prec1 <- precision(businesses15_2$Inactive, pred)
+prec1
+
+# Accuracy
+accu1 <- 1- misClassError(businesses15_2$Inactive, pred)
+accu1
+
+# Confusion Matrix
+table(predicted = pred, reference = businesses15_2$Inactive)
+
+# F1 Score
+F1_1 <- (2 * prec1 * sens1) / (prec1 + sens1)
+F1_1
+
+
+
+
+# 2016
+
+data <- subset(businesses16_2, Inactive == 0)
+data[] <- lapply(data, function(x) as.numeric(as.character(x)))
+#str(data)
+
+x <- subset(data, select = -Inactive)
+y <- data$Inactive
+model <- svm(x, y, type = 'one-classification')
+
+print(model)
+summary(model)
+
+pred <- predict(model, subset(businesses16_2, select = -Inactive))
+#pred
+
+## Evaluate
+# Sensitivity
+sens1 <- sensitivity(businesses16_2$Inactive, pred)
+sens1
+
+# Specificity
+spec1 <- specificity(businesses16_2$Inactive, pred)
+spec1
+
+# Precision
+prec1 <- precision(businesses16_2$Inactive, pred)
+prec1
+
+# Accuracy
+accu1 <- 1- misClassError(businesses16_2$Inactive, pred)
+accu1
+
+# Confusion Matrix
+table(predicted = pred, reference = businesses16_2$Inactive)
+
+# F1 Score
+F1_1 <- (2 * prec1 * sens1) / (prec1 + sens1)
+F1_1
+
+```
+
+
+
+### Random Forest Cross-Validation Test ###
+```{r}
+### Random Forest Cross-Validation TEST
+library(caret)
+library(randomForest)
+library(ROSE)
+library(dplyr)
+library(tidyr)
+
+#2014 ##########################
+## Standard
+summary(as.factor(businesses14_2$Inactive))
+businesses14_2$Inactive <- as.factor(businesses14_2$Inactive)
+set.seed(123)
+index <- createDataPartition(businesses14_2$Inactive, p = 0.7, list = F)
+train_data <- businesses14_2[index,]
+test_data <- businesses14_2[-index,]
+
+set.seed(123)
+model_rf <- caret::train(Inactive ~ ., data = train_data, method = "rf", 
+                         preProcess = c("scale", "center"), trControl = trainControl(method = "repeatedcv", 
+                                                                                     number = 10, repeats = 10, 
+                                                                                     verboseIter = F))
+
+final <- data.frame(actual = test_data$Inactive, predict(model_rf, newdata = test_data, type = "prob"))
+
+# Optimize cutoff
+p <- final[,2:3]
+optCutOff <- optimalCutoff(test_data$Inactive, p, optimiseFor = "Both")[1]
+optCutOff
+# Predict
+final$predict <- ifelse(final$X1 > optCutOff, 1, 0)
+cm_original <- confusionMatrix(as.character(test_data$Inactive), final$predict)
+cm_original
+
+sens1 <- sensitivity(test_data$Inactive, final$predict, threshold = optCutOff)
+sens1
+spec1 <- specificity(test_data$Inactive, final$predict, threshold = optCutOff)
+spec1
+prec1 <- precision(test_data$Inactive, final$predict, threshold = optCutOff)
+prec1
+accu1 <- 1-misClassError(test_data$Inactive, final$predict, threshold = optCutOff)
+accu1
+F1_1 <- (2 * prec1 * sens1) / (prec1 + sens1)
+F1_1
+
+## Under sampling
+ctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 10, verboseIter = F, sampling = "down")
+set.seed(123)
+model_rf_under <- caret::train(Inactive ~ .,
+                               data = train_data,
+                               method = "rf",
+                               preProcess = c("scale", "center"),
+                               trControl = ctrl)
+
+final_under <- data.frame(actual = test_data$Inactive, predict(model_rf_under, newdata = test_data, type = "prob"))
+#View(final_under)
+# Optimize cutoff
+p <- final_under[,2:3]
+optCutOff <- optimalCutoff(test_data$Inactive, p, optimiseFor = "Both")[1]
+optCutOff
+
+final_under$predict <- ifelse(final_under$X1 > optCutOff, 1, 0)
+cm_under <- confusionMatrix(as.character(test_data$Inactive), final_under$predict)
+cm_under
+
+# Evaluate
+sens1 <- sensitivity(test_data$Inactive, final_under$predict, threshold = optCutOff)
+sens1
+spec1 <- specificity(test_data$Inactive, final_under$predict, threshold = optCutOff)
+spec1
+prec1 <- precision(test_data$Inactive, final_under$predict, threshold = optCutOff)
+prec1
+accu1 <- 1-misClassError(test_data$Inactive, final_under$predict, threshold = optCutOff)
+accu1
+F1_1 <- (2 * prec1 * sens1) / (prec1 + sens1)
+F1_1
+
+
+## Over sampling
+ctrl <- trainControl(method = "repeatedcv", 
+                     number = 10, 
+                     repeats = 10, 
+                     verboseIter = FALSE,
+                     sampling = "up")
+
+set.seed(123)
+model_rf_over <- caret::train(Inactive ~ .,
+                              data = train_data,
+                              method = "rf",
+                              preProcess = c("scale", "center"),
+                              trControl = ctrl)
+
+final_over <- data.frame(actual = test_data$Inactive,
+                         predict(model_rf_over, newdata = test_data, type = "prob"))
+
+# Optimize cutoff
+p <- final_over[,2:3]
+optCutOff <- optimalCutoff(test_data$Inactive, p, optimiseFor = "Both")[1]
+optCutOff
+
+final_over$predict <- ifelse(final_over$X1 > optCutOff, 1, 0)
+cm_over <- confusionMatrix(as.character(test_data$Inactive), final_over$predict)
+cm_over
+
+# Evaluate
+sens1 <- sensitivity(test_data$Inactive, final_over$predict, threshold = optCutOff)
+sens1
+spec1 <- specificity(test_data$Inactive, final_over$predict, threshold = optCutOff)
+spec1
+prec1 <- precision(test_data$Inactive, final_over$predict, threshold = optCutOff)
+prec1
+accu1 <- 1-misClassError(test_data$Inactive, final_over$predict, threshold = optCutOff)
+accu1
+F1_1 <- (2 * prec1 * sens1) / (prec1 + sens1)
+F1_1
+
+
+## ROSE
+ctrl <- trainControl(method = "repeatedcv", 
+                     number = 10, 
+                     repeats = 10, 
+                     verboseIter = FALSE,
+                     sampling = "rose")
+
+set.seed(123)
+model_rf_rose <- caret::train(Inactive ~ .,
+                              data = train_data,
+                              method = "rf",
+                              preProcess = c("scale", "center"),
+                              trControl = ctrl)
+
+final_rose <- data.frame(actual = test_data$Inactive,
+                         predict(model_rf_rose, newdata = test_data, type = "prob"))
+
+# Optimize cutoff
+p <- final_rose[,2:3]
+optCutOff <- optimalCutoff(test_data$Inactive, p, optimiseFor = "Both")[1]
+optCutOff
+
+final_rose$predict <- ifelse(final_rose$X1 > optCutOff, 1, 0)
+cm_rose <- confusionMatrix(as.character(test_data$Inactive), final_rose$predict)
+cm_rose
+
+# Evaluate
+sens1 <- sensitivity(test_data$Inactive, final_rose$predict, threshold = optCutOff)
+sens1
+spec1 <- specificity(test_data$Inactive, final_rose$predict, threshold = optCutOff)
+spec1
+prec1 <- precision(test_data$Inactive, final_rose$predict, threshold = optCutOff)
+prec1
+accu1 <- 1-misClassError(test_data$Inactive, final_rose$predict, threshold = optCutOff)
+accu1
+F1_1 <- (2 * prec1 * sens1) / (prec1 + sens1)
+F1_1
+
+
+## SMOTE
+ctrl <- trainControl(method = "repeatedcv", 
+                     number = 10, 
+                     repeats = 10, 
+                     verboseIter = FALSE,
+                     sampling = "smote")
+
+set.seed(123)
+model_rf_smote <- caret::train(Inactive ~ .,
+                               data = train_data,
+                               method = "rf",
+                               preProcess = c("scale", "center"),
+                               trControl = ctrl)
+
+final_smote <- data.frame(actual = test_data$Inactive,
+                          predict(model_rf_smote, newdata = test_data, type = "prob"))
+
+# Optimize cutoff
+p <- final_smote[,2:3]
+optCutOff <- optimalCutoff(test_data$Inactive, p, optimiseFor = "Both")[1]
+optCutOff
+
+final_smote$predict <- ifelse(final_smote$X1 >optCutOff, 1, 0)
+cm_smote <- confusionMatrix(as.character(test_data$Inactive), final_smote$predict)
+cm_smote
+
+# Evaluate
+sens1 <- sensitivity(test_data$Inactive, final_smote$predict, threshold = optCutOff)
+sens1
+spec1 <- specificity(test_data$Inactive, final_smote$predict, threshold = optCutOff)
+spec1
+prec1 <- precision(test_data$Inactive, final_smote$predict, threshold = optCutOff)
+prec1
+accu1 <- 1-misClassError(test_data$Inactive, final_smote$predict, threshold = optCutOff)
+accu1
+F1_1 <- (2 * prec1 * sens1) / (prec1 + sens1)
+F1_1
+
+
+
+## Comparing Performance
+models <- list(original = model_rf,
+               under = model_rf_under,
+               over = model_rf_over,
+               smote = model_rf_smote,
+               rose = model_rf_rose)
+
+resampling <- resamples(models)
+bwplot(resampling)
+
+comparison <- data.frame(model = names(models),
+                         Sensitivity = rep(NA, length(models)),
+                         Specificity = rep(NA, length(models)),
+                         Precision = rep(NA, length(models)),
+                         Recall = rep(NA, length(models)),
+                         F1 = rep(NA, length(models)))
+
+for (name in names(models)) {
+  model <- get(paste0("cm_", name))
+  
+  comparison[comparison$model == name, ] <- filter(comparison, model == name) %>%
+    mutate(Sensitivity = model$byClass["Sensitivity"],
+           Specificity = model$byClass["Specificity"],
+           Precision = model$byClass["Precision"],
+           Recall = model$byClass["Recall"],
+           F1 = model$byClass["F1"])
+}
+
+comparison %>%
+  gather(x, y, Sensitivity:F1) %>%
+  ggplot(aes(x = x, y = y, color = model)) +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 3)
+
+
+# TRY stats::filter and dplyr::filter 
+model_rf$byClass["Sensitivity"]
+model_rf$byClass["Specificity"]
+## https://www.r-bloggers.com/dealing-with-unbalanced-data-in-machine-learning/
+
+
+
+##############################
+#2015
+## Standard
+summary(as.factor(businesses15_2$Inactive))
+businesses15_2$Inactive <- as.factor(businesses15_2$Inactive)
+set.seed(123)
+index <- createDataPartition(businesses15_2$Inactive, p = 0.7, list = F)
+train_data <- businesses15_2[index,]
+test_data <- businesses15_2[-index,]
+
+set.seed(123)
+model_rf <- caret::train(Inactive ~ ., data = train_data, method = "rf", 
+                         preProcess = c("scale", "center"), trControl = trainControl(method = "repeatedcv", 
+                                                                                     number = 10, repeats = 10, 
+                                                                                     verboseIter = F))
+
+final <- data.frame(actual = test_data$Inactive, predict(model_rf, newdata = test_data, type = "prob"))
+
+# Optimize cutoff
+p <- final[,2:3]
+optCutOff <- optimalCutoff(test_data$Inactive, p, optimiseFor = "Both")[1]
+optCutOff
+
+final$predict <- ifelse(final$X1 > optCutOff, 1, 0)
+cm_original <- confusionMatrix(as.character(test_data$Inactive), final$predict)
+cm_original
+
+# Evaluate
+sens1 <- sensitivity(test_data$Inactive, final$predict, threshold = optCutOff)
+sens1
+spec1 <- specificity(test_data$Inactive, final$predict, threshold = optCutOff)
+spec1
+prec1 <- precision(test_data$Inactive, final$predict, threshold = optCutOff)
+prec1
+accu1 <- 1-misClassError(test_data$Inactive, final$predict, threshold = optCutOff)
+accu1
+F1_1 <- (2 * prec1 * sens1) / (prec1 + sens1)
+F1_1
+
+
+## Under sampling
+ctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 10, verboseIter = F, sampling = "down")
+set.seed(123)
+model_rf_under <- caret::train(Inactive ~ .,
+                               data = train_data,
+                               method = "rf",
+                               preProcess = c("scale", "center"),
+                               trControl = ctrl)
+
+final_under <- data.frame(actual = test_data$Inactive, predict(model_rf_under, newdata = test_data, type = "prob"))
+#View(final_under)
+# Optimize cutoff
+p <- final_under[,2:3]
+optCutOff <- optimalCutoff(test_data$Inactive, p, optimiseFor = "Both")[1]
+optCutOff
+
+final_under$predict <- ifelse(final_under$X1 > optCutOff, 1, 0)
+cm_under <- confusionMatrix(as.character(test_data$Inactive), final_under$predict)
+cm_under
+# Evaluate
+sens1 <- sensitivity(test_data$Inactive, final_under$predict, threshold = optCutOff)
+sens1
+spec1 <- specificity(test_data$Inactive, final_under$predict, threshold = optCutOff)
+spec1
+prec1 <- precision(test_data$Inactive, final_under$predict, threshold = optCutOff)
+prec1
+accu1 <- 1-misClassError(test_data$Inactive, final_under$predict, threshold = optCutOff)
+accu1
+F1_1 <- (2 * prec1 * sens1) / (prec1 + sens1)
+F1_1
+
+
+## Over sampling
+ctrl <- trainControl(method = "repeatedcv", 
+                     number = 10, 
+                     repeats = 10, 
+                     verboseIter = FALSE,
+                     sampling = "up")
+
+set.seed(123)
+model_rf_over <- caret::train(Inactive ~ .,
+                              data = train_data,
+                              method = "rf",
+                              preProcess = c("scale", "center"),
+                              trControl = ctrl)
+
+final_over <- data.frame(actual = test_data$Inactive,
+                         predict(model_rf_over, newdata = test_data, type = "prob"))
+
+# Optimize cutoff
+p <- final_over[,2:3]
+optCutOff <- optimalCutoff(test_data$Inactive, p, optimiseFor = "Both")[1]
+optCutOff
+
+final_over$predict <- ifelse(final_over$X1 > optCutOff, 1, 0)
+cm_over <- confusionMatrix(as.character(test_data$Inactive), final_over$predict)
+cm_over
+# Evaluate
+sens1 <- sensitivity(test_data$Inactive, final_over$predict, threshold = optCutOff)
+sens1
+spec1 <- specificity(test_data$Inactive, final_over$predict, threshold = optCutOff)
+spec1
+prec1 <- precision(test_data$Inactive, final_over$predict, threshold = optCutOff)
+prec1
+accu1 <- 1-misClassError(test_data$Inactive, final_over$predict, threshold = optCutOff)
+accu1
+F1_1 <- (2 * prec1 * sens1) / (prec1 + sens1)
+F1_1
+
+
+## ROSE
+ctrl <- trainControl(method = "repeatedcv", 
+                     number = 10, 
+                     repeats = 10, 
+                     verboseIter = FALSE,
+                     sampling = "rose")
+
+set.seed(123)
+model_rf_rose <- caret::train(Inactive ~ .,
+                              data = train_data,
+                              method = "rf",
+                              preProcess = c("scale", "center"),
+                              trControl = ctrl)
+
+final_rose <- data.frame(actual = test_data$Inactive,
+                         predict(model_rf_rose, newdata = test_data, type = "prob"))
+
+
+# Optimize cutoff
+p <- final_rose[,2:3]
+optCutOff <- optimalCutoff(test_data$Inactive, p, optimiseFor = "Both")[1]
+optCutOff
+
+final_rose$predict <- ifelse(final_rose$X1 > optCutOff, 1, 0)
+cm_rose <- confusionMatrix(as.character(test_data$Inactive), final_rose$predict)
+cm_rose
+# Evaluate
+sens1 <- sensitivity(test_data$Inactive, final_rose$predict, threshold = optCutOff)
+sens1
+spec1 <- specificity(test_data$Inactive, final_rose$predict, threshold = optCutOff)
+spec1
+prec1 <- precision(test_data$Inactive, final_rose$predict, threshold = optCutOff)
+prec1
+accu1 <- 1-misClassError(test_data$Inactive, final_rose$predict, threshold = optCutOff)
+accu1
+F1_1 <- (2 * prec1 * sens1) / (prec1 + sens1)
+F1_1
+
+
+## SMOTE
+ctrl <- trainControl(method = "repeatedcv", 
+                     number = 10, 
+                     repeats = 10, 
+                     verboseIter = FALSE,
+                     sampling = "smote")
+
+set.seed(123)
+model_rf_smote <- caret::train(Inactive ~ .,
+                               data = train_data,
+                               method = "rf",
+                               preProcess = c("scale", "center"),
+                               trControl = ctrl)
+
+final_smote <- data.frame(actual = test_data$Inactive,
+                          predict(model_rf_smote, newdata = test_data, type = "prob"))
+# Optimize cutoff
+p <- final_smote[,2:3]
+optCutOff <- optimalCutoff(test_data$Inactive, p, optimiseFor = "Both")[1]
+optCutOff
+
+final_smote$predict <- ifelse(final_smote$X1 > optCutOff, 1, 0)
+cm_smote <- confusionMatrix(as.character(test_data$Inactive), final_smote$predict)
+cm_smote
+# Evaluate
+sens1 <- sensitivity(test_data$Inactive, final_smote$predict, threshold = optCutOff)
+sens1
+spec1 <- specificity(test_data$Inactive, final_smote$predict, threshold = optCutOff)
+spec1
+prec1 <- precision(test_data$Inactive, final_smote$predict, threshold = optCutOff)
+prec1
+accu1 <- 1-misClassError(test_data$Inactive, final_smote$predict, threshold = optCutOff)
+accu1
+F1_1 <- (2 * prec1 * sens1) / (prec1 + sens1)
+F1_1
+
+
+## Comparing Performance
+models <- list(original = model_rf,
+               under = model_rf_under,
+               over = model_rf_over,
+               smote = model_rf_smote,
+               rose = model_rf_rose)
+
+resampling <- resamples(models)
+bwplot(resampling)
+
+comparison <- data.frame(model = names(models),
+                         Sensitivity = rep(NA, length(models)),
+                         Specificity = rep(NA, length(models)),
+                         Precision = rep(NA, length(models)),
+                         Recall = rep(NA, length(models)),
+                         F1 = rep(NA, length(models)))
+
+for (name in names(models)) {
+  model <- get(paste0("cm_", name))
+  
+  comparison[comparison$model == name, ] <- filter(comparison, model == name) %>%
+    mutate(Sensitivity = model$byClass["Sensitivity"],
+           Specificity = model$byClass["Specificity"],
+           Precision = model$byClass["Precision"],
+           Recall = model$byClass["Recall"],
+           F1 = model$byClass["F1"])
+}
+
+comparison %>%
+  gather(x, y, Sensitivity:F1) %>%
+  ggplot(aes(x = x, y = y, color = model)) +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 3)
+## https://www.r-bloggers.com/dealing-with-unbalanced-data-in-machine-learning/
+
+
+
+##########################
+#2016
+## Standard
+summary(as.factor(businesses16_2$Inactive))
+businesses16_2$Inactive <- as.factor(businesses16_2$Inactive)
+set.seed(123)
+index <- createDataPartition(businesses16_2$Inactive, p = 0.7, list = F)
+train_data <- businesses16_2[index,]
+test_data <- businesses16_2[-index,]
+
+set.seed(123)
+model_rf <- caret::train(Inactive ~ ., data = train_data, method = "rf", 
+                         preProcess = c("scale", "center"), trControl = trainControl(method = "repeatedcv", 
+                                                                                     number = 10, repeats = 10, 
+                                                                                     verboseIter = F))
+
+final <- data.frame(actual = test_data$Inactive, predict(model_rf, newdata = test_data, type = "prob"))
+# Optimize cutoff
+p <- final[,2:3]
+optCutOff <- optimalCutoff(test_data$Inactive, p, optimiseFor = "Both")[1]
+optCutOff
+
+final$predict <- ifelse(final$X1 > optCutOff, 1, 0)
+cm_original <- confusionMatrix(as.character(test_data$Inactive), final$predict)
+cm_original
+# Evaluate
+sens1 <- sensitivity(test_data$Inactive, final$predict, threshold = optCutOff)
+sens1
+spec1 <- specificity(test_data$Inactive, final$predict, threshold = optCutOff)
+spec1
+prec1 <- precision(test_data$Inactive, final$predict, threshold = optCutOff)
+prec1
+accu1 <- 1-misClassError(test_data$Inactive, final$predict, threshold = optCutOff)
+accu1
+F1_1 <- (2 * prec1 * sens1) / (prec1 + sens1)
+F1_1
+
+
+## Under sampling
+ctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 10, verboseIter = F, sampling = "down")
+set.seed(123)
+model_rf_under <- caret::train(Inactive ~ .,
+                               data = train_data,
+                               method = "rf",
+                               preProcess = c("scale", "center"),
+                               trControl = ctrl)
+
+final_under <- data.frame(actual = test_data$Inactive, predict(model_rf_under, newdata = test_data, type = "prob"))
+#View(final_under)
+# Optimize cutoff
+p <- final_under[,2:3]
+optCutOff <- optimalCutoff(test_data$Inactive, p, optimiseFor = "Both")[1]
+optCutOff
+
+final_under$predict <- ifelse(final_under$X1 > optCutOff, 1, 0)
+cm_under <- confusionMatrix( as.character(test_data$Inactive), final_under$predict)
+cm_under
+# Evaluate
+sens1 <- sensitivity(test_data$Inactive, final_under$predict, threshold = optCutOff)
+sens1
+spec1 <- specificity(test_data$Inactive, final_under$predict, threshold = optCutOff)
+spec1
+prec1 <- precision(test_data$Inactive, final_under$predict, threshold = optCutOff)
+prec1
+accu1 <- 1-misClassError(test_data$Inactive, final_under$predict, threshold = optCutOff)
+accu1
+F1_1 <- (2 * prec1 * sens1) / (prec1 + sens1)
+F1_1
+
+
+## Over sampling
+ctrl <- trainControl(method = "repeatedcv", 
+                     number = 10, 
+                     repeats = 10, 
+                     verboseIter = FALSE,
+                     sampling = "up")
+
+set.seed(123)
+model_rf_over <- caret::train(Inactive ~ .,
+                              data = train_data,
+                              method = "rf",
+                              preProcess = c("scale", "center"),
+                              trControl = ctrl)
+
+final_over <- data.frame(actual = test_data$Inactive,
+                         predict(model_rf_over, newdata = test_data, type = "prob"))
+
+# Optimize cutoff
+p <- final_over[,2:3]
+optCutOff <- optimalCutoff(test_data$Inactive, p, optimiseFor = "Both")[1]
+optCutOff
+
+final_over$predict <- ifelse(final_over$X1 > optCutOff, 1, 0)
+cm_over <- confusionMatrix(as.character(test_data$Inactive), final_over$predict)
+cm_over
+# Evaluate
+sens1 <- sensitivity(test_data$Inactive, final_over$predict, threshold = optCutOff)
+sens1
+spec1 <- specificity(test_data$Inactive, final_over$predict, threshold = optCutOff)
+spec1
+prec1 <- precision(test_data$Inactive, final_over$predict, threshold = optCutOff)
+prec1
+accu1 <- 1-misClassError(test_data$Inactive, final_over$predict, threshold = optCutOff)
+accu1
+F1_1 <- (2 * prec1 * sens1) / (prec1 + sens1)
+F1_1
+
+
+## ROSE
+ctrl <- trainControl(method = "repeatedcv", 
+                     number = 10, 
+                     repeats = 10, 
+                     verboseIter = FALSE,
+                     sampling = "rose")
+
+set.seed(123)
+model_rf_rose <- caret::train(Inactive ~ .,
+                              data = train_data,
+                              method = "rf",
+                              preProcess = c("scale", "center"),
+                              trControl = ctrl)
+
+final_rose <- data.frame(actual = test_data$Inactive,
+                         predict(model_rf_rose, newdata = test_data, type = "prob"))
+
+# Optimize cutoff
+p <- final_rose[,2:3]
+optCutOff <- optimalCutoff(test_data$Inactive, p, optimiseFor = "Both")[1]
+optCutOff
+
+final_rose$predict <- ifelse(final_rose$X1 > optCutOff, 1, 0)
+cm_rose <- confusionMatrix(as.character(test_data$Inactive), final_rose$predict)
+cm_rose
+# Evaluate
+sens1 <- sensitivity(test_data$Inactive, final_rose$predict, threshold = optCutOff)
+sens1
+spec1 <- specificity(test_data$Inactive, final_rose$predict, threshold = optCutOff)
+spec1
+prec1 <- precision(test_data$Inactive, final_rose$predict, threshold = optCutOff)
+prec1
+accu1 <- 1-misClassError(test_data$Inactive, final_rose$predict, threshold = optCutOff)
+accu1
+F1_1 <- (2 * prec1 * sens1) / (prec1 + sens1)
+F1_1
+
+
+## SMOTE
+ctrl <- trainControl(method = "repeatedcv", 
+                     number = 10, 
+                     repeats = 10, 
+                     verboseIter = FALSE,
+                     sampling = "smote")
+
+set.seed(123)
+model_rf_smote <- caret::train(Inactive ~ .,
+                               data = train_data,
+                               method = "rf",
+                               preProcess = c("scale", "center"),
+                               trControl = ctrl)
+
+final_smote <- data.frame(actual = test_data$Inactive,
+                          predict(model_rf_smote, newdata = test_data, type = "prob"))
+
+# Optimize cutoff
+p <- final_smote[,2:3]
+optCutOff <- optimalCutoff(test_data$Inactive, p, optimiseFor = "Both")[1]
+optCutOff
+
+final_smote$predict <- ifelse(final_smote$X1 >optCutOff, 1, 0)
+cm_smote <- confusionMatrix( as.character(test_data$Inactive), final_smote$predict)
+cm_smote
+# Evaluate
+sens1 <- sensitivity(test_data$Inactive, final_smote$predict, threshold = optCutOff)
+sens1
+spec1 <- specificity(test_data$Inactive, final_smote$predict, threshold = optCutOff)
+spec1
+prec1 <- precision(test_data$Inactive, final_smote$predict, threshold = optCutOff)
+prec1
+accu1 <- 1-misClassError(test_data$Inactive, final_smote$predict, threshold = optCutOff)
+accu1
+F1_1 <- (2 * prec1 * sens1) / (prec1 + sens1)
+F1_1
+
+
+## Comparing Performance
+models <- list(original = model_rf,
+               under = model_rf_under,
+               over = model_rf_over,
+               smote = model_rf_smote,
+               rose = model_rf_rose)
+
+resampling <- resamples(models)
+bwplot(resampling)
+
+comparison <- data.frame(model = names(models),
+                         Sensitivity = rep(NA, length(models)),
+                         Specificity = rep(NA, length(models)),
+                         Precision = rep(NA, length(models)),
+                         Recall = rep(NA, length(models)),
+                         F1 = rep(NA, length(models)))
+
+for (name in names(models)) {
+  model <- get(paste0("cm_", name))
+  
+  comparison[comparison$model == name, ] <- filter(comparison, model == name) %>%
+    mutate(Sensitivity = model$byClass["Sensitivity"],
+           Specificity = model$byClass["Specificity"],
+           Precision = model$byClass["Precision"],
+           Recall = model$byClass["Recall"],
+           F1 = model$byClass["F1"])
+}
+
+comparison %>%
+  gather(x, y, Sensitivity:F1) %>%
+  ggplot(aes(x = x, y = y, color = model)) +
+  geom_jitter(width = 0.2, alpha = 0.5, size = 3)
+## https://www.r-bloggers.com/dealing-with-unbalanced-data-in-machine-learning/
+
+
+## Does the model work? Not sure about using 0.5 for predict probability cutoff.
+
+```
+
+
+
+
+# RESULTS #
+### See paper ###
+
+
+
+# DISCUSSION #
+### See paper #
+
+
+
+
